@@ -125,6 +125,13 @@ export async function enforceIpAllowlist(c: Context, next: Next) {
     return next();
   }
   if (BROKEN) return c.json({ error: 'Forbidden' }, 403);
+  // Local agent sessions call the API directly and still need bearer auth.
+  // A forwarded request must never qualify: nginx may connect over loopback
+  // on behalf of a remote client outside the allowlist.
+  const peer = unmap(socketAddr(c));
+  if ((peer === '127.0.0.1' || peer === '::1') && !c.req.header('x-forwarded-for')) {
+    return next();
+  }
   const ip = clientIp(c);
   if (!ip || !inNets(ip, ALLOWED.nets)) {
     console.warn(`[access-control] denied ${ip || '<unknown>'} -> ${path}`);

@@ -8,9 +8,17 @@
 #
 # The production image also runs the in-pod launcher + headed browser stack so
 # agent dispatch and noVNC survive pod restarts.
+#
+# Node is pinned to 22, not 24, deliberately: this image's AKS deployment can
+# run from an NFS-mounted source override (see docker-launcher-entrypoint.sh's
+# NFS_MARKER path) whose better-sqlite3 native addon is compiled against
+# Node 22's ABI. The CVE fix that matters here is the pnpm 9.15.9 -> 12.11.2
+# bump (it replaces pnpm's own bundled tar/brace-expansion/minimatch/undici/
+# glob/pacote); Node 22 + pnpm 12.11.2 clears the same findings without an
+# ABI mismatch against that NFS tree.
 
 # ---- Stage 1: build the whole workspace -------------------------------------
-FROM node:24-bookworm AS build
+FROM node:22-bookworm AS build
 RUN corepack enable && corepack prepare pnpm@12.11.2 --activate
 WORKDIR /app
 
@@ -30,7 +38,7 @@ COPY packages/server/ packages/server/
 RUN pnpm run build
 
 # ---- Stage 2: production runtime --------------------------------------------
-FROM node:24-bookworm-slim
+FROM node:22-bookworm-slim
 # node:*-slim ships with no locale set (POSIX/C). tmux then renders every
 # non-ASCII glyph in the agent TUIs as "_", so Claude Code's arrows/ellipses
 # show up as "--" in the browser terminal. C.UTF-8 is built into glibc.

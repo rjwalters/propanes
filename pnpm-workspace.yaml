@@ -1,2 +1,13 @@
 packages:
   - "packages/*"
+
+# pnpm 11+ blocks dependency lifecycle (install/postinstall) scripts by
+# default. These packages compile native addons (better-sqlite3, node-pty,
+# cpu-features/ssh2) or fetch a platform binary (esbuild) and need their
+# scripts to run for the workspace to build/run at all.
+allowBuilds:
+  better-sqlite3: true
+  cpu-features: true
+  esbuild: true
+  node-pty: true
+  ssh2: true

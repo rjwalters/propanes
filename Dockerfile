@@ -10,8 +10,8 @@
 # agent dispatch and noVNC survive pod restarts.
 
 # ---- Stage 1: build the whole workspace -------------------------------------
-FROM node:22-bookworm AS build
-RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
+FROM node:24-bookworm AS build
+RUN corepack enable && corepack prepare pnpm@12.11.2 --activate
 WORKDIR /app
 
 # Workspace config first for layer caching
@@ -30,12 +30,12 @@ COPY packages/server/ packages/server/
 RUN pnpm run build
 
 # ---- Stage 2: production runtime --------------------------------------------
-FROM node:22-bookworm-slim
+FROM node:24-bookworm-slim
 # node:*-slim ships with no locale set (POSIX/C). tmux then renders every
 # non-ASCII glyph in the agent TUIs as "_", so Claude Code's arrows/ellipses
 # show up as "--" in the browser terminal. C.UTF-8 is built into glibc.
 ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
-RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
+RUN corepack enable && corepack prepare pnpm@12.11.2 --activate
 RUN groupadd --gid 10001 propanes \
  && useradd --uid 10001 --gid 10001 --home-dir /data/agent-home --shell /bin/bash propanes
 WORKDIR /app

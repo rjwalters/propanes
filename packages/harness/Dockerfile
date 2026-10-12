@@ -1,7 +1,7 @@
 # Stage 1: Build all packages
-FROM node:22-bookworm AS build
+FROM node:24-bookworm AS build
 
-RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
+RUN corepack enable && corepack prepare pnpm@12.11.2 --activate
 
 WORKDIR /app
 
@@ -27,9 +27,9 @@ COPY packages/server/ packages/server/
 RUN pnpm run build
 
 # Stage 2: Production runtime
-FROM node:22-bookworm-slim
+FROM node:24-bookworm-slim
 
-RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
+RUN corepack enable && corepack prepare pnpm@12.11.2 --activate
 
 WORKDIR /app
 

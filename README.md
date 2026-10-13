@@ -26,8 +26,39 @@ Now you're cooking with gases.
 ## Quick start
 
 ```bash
-git clone <repo> propanes
+git clone https://github.com/tinkerer/propanes.git
 cd propanes
+./scripts/setup.sh
+```
+
+That one command takes a bare machine to an open dashboard: it checks for git,
+node >= 22 and tmux (installing whatever is missing via brew/apt/dnf/pacman),
+activates the pinned pnpm, installs and builds the workspace, downloads the
+Playwright chromium build, boots the server, registers this checkout as an
+application with `claude` and `codex` yolo agent endpoints, and opens
+`http://localhost:3001/admin/`. It is idempotent — re-running on a configured
+machine just brings the dashboard back up.
+
+| Command | Does |
+|---|---|
+| `pnpm setup` | The full bootstrap above |
+| `pnpm doctor` | Report missing prerequisites and exit, changing nothing |
+| `pnpm seed` | Re-register the local app + agent endpoints against a running server |
+
+Useful flags: `--doctor`, `-y` (don't ask before installing system deps),
+`--no-open`, `--no-start`, `--no-playwright`, `--no-seed`, `--port N`.
+
+`pnpm setup` finishes with an **agent runtime readiness** report, because an
+installed CLI is not the same as a dispatchable one. Both runtimes have
+one-time gates that Propanes can detect but cannot answer for you — notably
+Claude Code's "trust this folder" dialog and, for the `*-yolo` profiles, its
+Bypass Permissions acceptance. Until those are accepted once, a dispatched
+session starts and then sits waiting for input. The report prints the exact
+command to clear each one.
+
+### Doing it by hand
+
+```bash
 pnpm install
 pnpm dev
 ```
@@ -68,7 +99,12 @@ Agent processes are isolated separately. `docker-launcher-entrypoint.sh` starts
 `launcher-daemon` as the `propanes` user, UID/GID 10001, with
 `HOME=/data/agent-home`. On startup it copies Claude and Codex auth from the
 read-only `/var/run/propanes-agent-auth` Kubernetes Secret into writable files
-under `/data/agent-home`, then points `/root/.claude`, `/root/.codex`, and
+under `/data/agent-home`. The secret's `claude-settings.json` key is merged
+into `settings.json` as bootstrap defaults: it supplies only the keys the home
+does not already have, at the top level and inside `env`, so a fresh home comes
+up pointed at the right provider while an existing one — which is what `/model`
+writes into and what an operator hand-edits — always wins. The entrypoint then
+points `/root/.claude`, `/root/.codex`, and
 `/root/.claude.json` at that writable home for CLI compatibility. This keeps
 Claude/Codex credential refreshes writable without running YOLO agent sessions
 as root.

@@ -17,22 +17,22 @@ export const WIDGET_CSS = `
   z-index: 2147483647;
   width: 48px;
   height: 48px;
-  border-radius: 50%;
-  background: #1d9bf0;
-  border: none;
+  border-radius: 12px;
+  background: #292929;
+  border: 1px solid #737373;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
-  box-shadow: 0 4px 12px rgba(29, 155, 240, 0.4);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
   transition: transform 0.2s, box-shadow 0.2s;
   touch-action: none;
   -webkit-tap-highlight-color: transparent;
 }
 
 .pw-trigger:hover {
-  transform: scale(1.1);
-  box-shadow: 0 6px 16px rgba(29, 155, 240, 0.5);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.24);
 }
 
 .pw-trigger svg {
@@ -924,6 +924,34 @@ export const WIDGET_CSS = `
   fill: currentColor;
 }
 
+/* In-flight: swap the paper-plane for a spinner and lock the button so a
+   submit can't be re-fired while its POST is round-tripping. */
+.pw-send-btn.pw-send-busy {
+  cursor: default;
+  transform: none;
+}
+.pw-send-btn.pw-send-busy:hover {
+  background: #1d9bf0;
+}
+.pw-send-btn.pw-send-busy.pw-dispatch-active:hover {
+  background: #eab308;
+}
+.pw-send-btn.pw-send-busy svg {
+  display: none;
+}
+.pw-send-btn.pw-send-busy::after {
+  content: '';
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255, 255, 255, 0.4);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: pw-send-spin 0.6s linear infinite;
+}
+@keyframes pw-send-spin {
+  to { transform: rotate(360deg); }
+}
+
 .pw-send-dropdown-toggle {
   height: 32px;
   width: 24px;
@@ -1075,6 +1103,11 @@ export const WIDGET_CSS = `
 }
 .pw-send-menu-send-btn:hover {
   background: #1a8cd8 !important;
+}
+
+.pw-send-menu-send-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .pw-flash {

@@ -269,10 +269,29 @@ export const agentSessions = sqliteTable('agent_sessions', {
   // JSON array of GitHub PR URLs detected in this session's output (see
   // pr-detect.ts). Powers the "PR #123" tag in the admin session lists/header.
   prUrls: text('pr_urls'),
+  // Manual corrections from the session menu (pr-overrides.ts), JSON arrays.
+  // Kept apart from pr_urls, which the session-service rewrites wholesale.
+  prUrlsAdded: text('pr_urls_added'),
+  prUrlsHidden: text('pr_urls_hidden'),
   // Phase 5 — the isolation mode this session actually ran in, and the id of
   // the ephemeral isolate (git-worktree path token) when isolation='per_session'.
   isolation: text('isolation').notNull().default('shared'),
   isolateId: text('isolate_id'),
+  // Set only by cleanupOrphanedSessions() when it marks a 'running' row
+  // 'failed' because nothing (session-service, launcher, sprite) confirms it
+  // alive — i.e. the process tree died out from under the DB row, typically
+  // because propanes.service itself restarted. Every OTHER path that sets
+  // status='failed' (bad exit code, dispatch exception, sprite error, ...) is
+  // a real failure and leaves this null. This is what lets the restart/restore
+  // queue (restore-queue.ts) query "sessions orphaned by a restart" without
+  // conflating them with ordinary task failures.
+  failureReason: text('failure_reason'),
+  // Operator said "handled, don't restore" on a restore-queue item without
+  // actually resuming it. Keeps it out of the queue going forward. A real
+  // restore never needs this: the new resumed row naturally supersedes the
+  // old one in the queue's per-claudeSessionId dedup (it becomes the most
+  // recent row for that conversation, and it isn't itself orphaned).
+  restoreDismissedAt: text('restore_dismissed_at'),
   createdAt: text('created_at').notNull(),
   startedAt: text('started_at'),
   completedAt: text('completed_at'),

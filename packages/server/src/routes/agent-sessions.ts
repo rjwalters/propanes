@@ -1,4 +1,4 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { eq, desc, ne, and, inArray, or, sql } from 'drizzle-orm';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { hostname as osHostname } from 'node:os';
@@ -7,11 +7,22 @@ import { createHash } from 'node:crypto';
 import { db, schema } from '../db/index.js';
 import { killSession } from '../agent-sessions.js';
 import { resumeAgentSession, dispatchTerminalSession, transferSession, getTransfer } from '../dispatch.js';
+import {
+  listRestoreQueue,
+  restoreQueueItem,
+  dismissRestoreQueueItem,
+  startBulkRestore,
+  getBulkRestoreProgress,
+  getSessionOutcome,
+  DEFAULT_RESTORE_PROMPT,
+} from '../restore-queue.js';
 import { getSessionLiveStates, inputSessionRemote, sendKeysSessionRemote } from '../session-service-client.js';
 import { getLauncher, sendAndWait } from '../launcher-registry.js';
+import { getTmuxPanePid } from '../tmux-pty.js';
 import { storeUploads } from './uploads.js';
 import { listSessions, sendCommand } from '../sessions.js';
 import { getAdminUser, memberSessionScope, visibleToMember } from '../admin-auth.js';
+import { applyPrOverride, defaultRepoForSession, effectivePrUrls, normalizePrInput, parseUrlList } from '../pr-overrides.js';
 import {
   computeJsonlPath,
   computeJsonlDir,
@@ -23,6 +34,7 @@ import {
   exportSessionFiles,
   listJsonlFiles,
   collectJsonlUnits,
+  jsonlCursorNeedsReset,
   readJsonlFileDelta,
   type JsonlUnit,
 } from '../jsonl-utils.js';
@@ -37,8 +49,12 @@ function resolveJsonlPath(
   runtime?: string | null,
   startedAt?: string | null,
   status?: string | null,
+  agentSessionId?: string,
 ): string | null {
-  return resolveSessionJsonlPath(appProjectDir, sessionCwd, runtime, claudeSessionId, startedAt, status);
+  const liveProcessId = agentSessionId && (status === 'running' || status === 'pending')
+    ? getTmuxPanePid(agentSessionId)
+    : null;
+  return resolveSessionJsonlPath(appProjectDir, sessionCwd, runtime, claudeSessionId, startedAt, status, undefined, liveProcessId);
 }
 
 export const agentSessionRoutes = new Hono();
@@ -59,6 +75,69 @@ agentSessionRoutes.get('/transfers/:transferId', async (c) => {
     parentSessionId: transfer.parentSessionId,
     error: transfer.error,
   });
+});
+
+// Restart/restore workflow — admin-only, cluster-wide (not member-scoped: an
+// orphaned session belongs to whoever owned it, but triaging a service
+// restart is an operator task). Registered before /:id so these literal
+// paths aren't swallowed by the :id param route below.
+agentSessionRoutes.get('/restore-queue', async (c) => {
+  if (getAdminUser(c).role !== 'admin') return c.json({ error: 'Unauthorized' }, 403);
+  const items = await listRestoreQueue();
+  return c.json({ items, defaultPrompt: DEFAULT_RESTORE_PROMPT });
+});
+
+agentSessionRoutes.get('/restore-queue/outcomes', async (c) => {
+  if (getAdminUser(c).role !== 'admin') return c.json({ error: 'Unauthorized' }, 403);
+  const idsParam = c.req.query('ids') || '';
+  const ids = idsParam.split(',').map((s) => s.trim()).filter(Boolean);
+  const outcomes: Record<string, string> = {};
+  for (const id of ids) outcomes[id] = getSessionOutcome(id);
+  return c.json({ outcomes });
+});
+
+agentSessionRoutes.post('/restore-queue/:id/restore', async (c) => {
+  if (getAdminUser(c).role !== 'admin') return c.json({ error: 'Unauthorized' }, 403);
+  const id = c.req.param('id');
+  const body = await c.req.json().catch(() => ({}));
+  const prompt = typeof body.prompt === 'string' ? body.prompt : undefined;
+  try {
+    const result = await restoreQueueItem(id, { prompt });
+    return c.json(result);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Restore failed';
+    return c.json({ error: msg }, 400);
+  }
+});
+
+agentSessionRoutes.post('/restore-queue/:id/dismiss', async (c) => {
+  if (getAdminUser(c).role !== 'admin') return c.json({ error: 'Unauthorized' }, 403);
+  const id = c.req.param('id');
+  const ok = dismissRestoreQueueItem(id);
+  if (!ok) return c.json({ error: 'Not an open restore-queue item' }, 404);
+  return c.json({ id, dismissed: true });
+});
+
+agentSessionRoutes.post('/restore-queue/restore-all', async (c) => {
+  if (getAdminUser(c).role !== 'admin') return c.json({ error: 'Unauthorized' }, 403);
+  const body = await c.req.json().catch(() => ({}));
+  let ids: string[] = Array.isArray(body.ids) ? body.ids.filter((v: unknown) => typeof v === 'string') : [];
+  if (ids.length === 0) {
+    const items = await listRestoreQueue();
+    ids = items.map((i) => i.id);
+  }
+  if (ids.length === 0) return c.json({ error: 'Nothing to restore' }, 400);
+  const prompt = typeof body.prompt === 'string' ? body.prompt : undefined;
+  const intervalMs = typeof body.intervalMs === 'number' ? body.intervalMs : undefined;
+  const runId = startBulkRestore(ids, { prompt, intervalMs });
+  return c.json({ runId, total: ids.length });
+});
+
+agentSessionRoutes.get('/restore-queue/bulk/:runId', async (c) => {
+  if (getAdminUser(c).role !== 'admin') return c.json({ error: 'Unauthorized' }, 403);
+  const progress = getBulkRestoreProgress(c.req.param('runId'));
+  if (!progress) return c.json({ error: 'Unknown or expired run' }, 404);
+  return c.json(progress);
 });
 
 // Search JSONL content across all sessions
@@ -318,6 +397,8 @@ const sessionSelectFields = {
   cosThreadId: schema.agentSessions.cosThreadId,
   title: schema.agentSessions.title,
   prUrls: schema.agentSessions.prUrls,
+  prUrlsAdded: schema.agentSessions.prUrlsAdded,
+  prUrlsHidden: schema.agentSessions.prUrlsHidden,
   createdAt: schema.agentSessions.createdAt,
   startedAt: schema.agentSessions.startedAt,
   completedAt: schema.agentSessions.completedAt,
@@ -443,11 +524,8 @@ async function enrichSessions(rows: SessionRow[]) {
       agentName: r.agentName || null,
       title: r.title || null,
       prUrls: (() => {
-        if (!r.prUrls) return null;
-        try {
-          const parsed = JSON.parse(r.prUrls);
-          return Array.isArray(parsed) && parsed.length ? parsed : null;
-        } catch { return null; }
+        const urls = effectivePrUrls(r.prUrls, r.prUrlsAdded, r.prUrlsHidden);
+        return urls.length ? urls : null;
       })(),
       appId: r.feedbackAppId || r.agentAppId || r.cosThreadAppId || null,
       cosThreadId: r.cosThreadId || null,
@@ -565,7 +643,47 @@ agentSessionRoutes.get('/:id', async (c) => {
     return c.json({ error: 'Not found' }, 404);
   }
 
-  return c.json(session);
+  const prUrls = effectivePrUrls(session.prUrls, session.prUrlsAdded, session.prUrlsHidden);
+  return c.json({ ...session, prUrls: prUrls.length ? JSON.stringify(prUrls) : null });
+});
+
+// Correct the session's PR badges by hand: `{ add }` takes a PR URL,
+// `owner/repo#123` or a bare number (resolved against the session's repo);
+// `{ remove }` takes a URL currently shown. See pr-overrides.ts.
+agentSessionRoutes.post('/:id/pr-urls', async (c) => {
+  const id = c.req.param('id');
+  const body = await c.req.json().catch(() => ({})) as { add?: unknown; remove?: unknown };
+  const session = db.select().from(schema.agentSessions).where(eq(schema.agentSessions.id, id)).get();
+  if (!session || !visibleToMember(session, getAdminUser(c))) {
+    return c.json({ error: 'Not found' }, 404);
+  }
+  const detected = parseUrlList(session.prUrls);
+  const added = parseUrlList(session.prUrlsAdded);
+  const hidden = parseUrlList(session.prUrlsHidden);
+
+  let add: string | undefined;
+  if (typeof body.add === 'string' && body.add.trim()) {
+    const bareNumber = /^\s*(?:PR\s*)?#?\d+\s*$/i.test(body.add);
+    const repo = bareNumber ? await defaultRepoForSession([...added, ...detected], session.cwd) : null;
+    const url = normalizePrInput(body.add, repo);
+    if (!url) {
+      return c.json({ error: bareNumber
+        ? 'Could not tell which repo this PR number is in; paste the full PR URL'
+        : 'Expected a GitHub PR URL, owner/repo#123, or a PR number' }, 400);
+    }
+    add = url;
+  }
+  const remove = typeof body.remove === 'string' && body.remove ? body.remove : undefined;
+  if (!add && !remove) return c.json({ error: 'Nothing to change: pass add or remove' }, 400);
+
+  const next = applyPrOverride(detected, added, hidden, { add, remove });
+  const addedJson = next.added.length ? JSON.stringify(next.added) : null;
+  const hiddenJson = next.hidden.length ? JSON.stringify(next.hidden) : null;
+  db.update(schema.agentSessions)
+    .set({ prUrlsAdded: addedJson, prUrlsHidden: hiddenJson })
+    .where(eq(schema.agentSessions.id, id))
+    .run();
+  return c.json({ id, prUrls: effectivePrUrls(session.prUrls, addedJson, hiddenJson), added: add || null });
 });
 
 agentSessionRoutes.post('/:id/kill', async (c) => {
@@ -862,7 +980,7 @@ agentSessionRoutes.get('/:id/jsonl-files', async (c) => {
     return c.json({ error: 'Session not found' }, 404);
   }
 
-  const jsonlPath = resolveJsonlPath(row.appProjectDir, row.cwd, row.claudeSessionId, row.runtime, row.startedAt, row.status);
+  const jsonlPath = resolveJsonlPath(row.appProjectDir, row.cwd, row.claudeSessionId, row.runtime, row.startedAt, row.status, id);
   if (!jsonlPath) {
     return c.json({ error: 'No JSONL path available' }, 400);
   }
@@ -870,16 +988,16 @@ agentSessionRoutes.get('/:id/jsonl-files', async (c) => {
   // Codex sessions don't have continuations or subagents — there's just one
   // rollout file per session. List it directly.
   const isCodex = row.runtime === 'codex';
-  const resolvedCodexSessionId = isCodex && jsonlPath
+  const resolvedSessionId = isCodex && jsonlPath
     ? basename(jsonlPath, '.jsonl').replace(/^rollout-\d{4}-\d{2}-\d{2}T[\d-]+-/, '')
-    : row.claudeSessionId;
+    : basename(jsonlPath, '.jsonl');
   const files = existsSync(jsonlPath)
     ? (isCodex
-        ? [{ id: `main:${resolvedCodexSessionId || basename(jsonlPath, '.jsonl')}`, claudeSessionId: resolvedCodexSessionId || basename(jsonlPath, '.jsonl'), type: 'main' as const, label: `Codex: ${basename(jsonlPath)}`, filePath: jsonlPath, order: 0, parentSessionId: undefined, agentId: undefined }]
+        ? [{ id: `main:${resolvedSessionId || basename(jsonlPath, '.jsonl')}`, claudeSessionId: resolvedSessionId || basename(jsonlPath, '.jsonl'), type: 'main' as const, label: `Codex: ${basename(jsonlPath)}`, filePath: jsonlPath, order: 0, parentSessionId: undefined, agentId: undefined }]
         : listJsonlFiles(jsonlPath))
     : [];
   return c.json({
-    claudeSessionId: resolvedCodexSessionId,
+    claudeSessionId: resolvedSessionId,
     runtime: row.runtime || 'claude',
     files: files.map(f => ({
       id: f.id,
@@ -985,20 +1103,30 @@ function computeJsonlEtag(units: JsonlUnit[], tailN: number): string {
   return `W/"${h.digest('hex')}"`;
 }
 
-agentSessionRoutes.get('/:id/jsonl', async (c) => {
+interface JsonlRequestParams {
+  /** optional: specific file id like "main:uuid", "cont:uuid", "sub:uuid:agentId" */
+  fileFilter?: string;
+  /** Optional: return only the last N lines of the merged output. Keeps the
+   *  initial payload small for mobile clients that freeze parsing multi-MB
+   *  JSONL synchronously. Desktop callers can omit it for the full history. */
+  tail?: string;
+  /** Differential updates: 'init' (first poll) or an opaque cursor from a
+   *  previous response. Switches the response to JSON with only the bytes
+   *  appended since the cursor, instead of the entire merged transcript. */
+  cursor?: string;
+}
+
+const handleJsonlRequest = async (c: Context, params: JsonlRequestParams) => {
   const id = c.req.param('id');
-  const fileFilter = c.req.query('file'); // optional: specific file id like "main:uuid", "cont:uuid", "sub:uuid:agentId"
-  // Optional: return only the last N lines of the merged output. Keeps the
-  // initial payload small for mobile clients that freeze parsing multi-MB
-  // JSONL synchronously. Desktop callers can omit it for the full history.
-  const tailParam = c.req.query('tail');
+  if (!id) {
+    return c.json({ error: 'Missing session id' }, 400);
+  }
+  const fileFilter = params.fileFilter;
+  const tailParam = params.tail;
   const tailN = tailParam ? Math.max(0, parseInt(tailParam, 10) || 0) : 0;
   // Treat any tail request as a mobile client for redaction purposes.
   const dropImageData = tailN > 0;
-  // Differential updates: ?cursor=init (first poll) or an opaque cursor from a
-  // previous response. Switches the response to JSON with only the bytes
-  // appended since the cursor, instead of the entire merged transcript.
-  const cursorParam = c.req.query('cursor');
+  const cursorParam = params.cursor;
   const isDifferential = cursorParam !== undefined && cursorParam !== '';
   // Expected-missing transcript: the agent is still spinning up, the session
   // has no resolvable JSONL path (plain terminal), or a filtered file vanished.
@@ -1073,7 +1201,7 @@ agentSessionRoutes.get('/:id/jsonl', async (c) => {
     }
   }
 
-  const jsonlPath = resolveJsonlPath(row.appProjectDir, row.cwd, row.claudeSessionId, row.runtime, row.startedAt, row.status);
+  const jsonlPath = resolveJsonlPath(row.appProjectDir, row.cwd, row.claudeSessionId, row.runtime, row.startedAt, row.status, id);
   if (!jsonlPath) {
     if (isDifferential) return pendingDelta();
     return c.json({ error: 'No JSONL path available' }, 400);
@@ -1123,7 +1251,10 @@ agentSessionRoutes.get('/:id/jsonl', async (c) => {
     // nothing will ever complete it.
     const consumePartial = !isLive;
     const offsets = decodeJsonlCursor(cursorParam);
-    let reset = offsets === null;
+    // A disappeared key means the main transcript rotated (not merely that a
+    // subagent/continuation was added). Reset so mobile tailing applies and the
+    // browser drops buffers belonging to the pre-clear transcript.
+    let reset = jsonlCursorNeedsReset(offsets, units);
 
     const readUnits = () => {
       const newOffsets: Record<string, number> = {};
@@ -1200,6 +1331,29 @@ agentSessionRoutes.get('/:id/jsonl', async (c) => {
   const out = tailN > 0 ? allLines.slice(-tailN) : allLines;
   c.header('ETag', etag);
   return c.text(redactLines(out, dropImageData, id).join('\n'));
+};
+
+agentSessionRoutes.get('/:id/jsonl', (c) =>
+  handleJsonlRequest(c, {
+    fileFilter: c.req.query('file'),
+    tail: c.req.query('tail'),
+    cursor: c.req.query('cursor'),
+  }),
+);
+
+// Same handler, cursor in the body. The differential cursor carries a byte
+// offset per physical transcript file, so a session with hundreds of subagent
+// JSONLs produces a cursor tens of kilobytes long — far past Node's 16 KB
+// header cap, which answers the poll with an unhelpful HTTP 431. Posting the
+// cursor keeps long sessions pollable regardless of how many files they span.
+agentSessionRoutes.post('/:id/jsonl', async (c) => {
+  const body = await c.req.json().catch(() => ({} as Record<string, unknown>));
+  const { file, tail, cursor } = body as Record<string, unknown>;
+  return handleJsonlRequest(c, {
+    fileFilter: typeof file === 'string' && file ? file : undefined,
+    tail: typeof tail === 'number' || typeof tail === 'string' ? String(tail) : undefined,
+    cursor: typeof cursor === 'string' ? cursor : undefined,
+  });
 });
 
 // Serve a single inline image out of a session's JSONL transcript. The mobile
@@ -1240,7 +1394,7 @@ agentSessionRoutes.get('/:id/jsonl-image/:uuid/:imgIndex', async (c) => {
     return c.json({ error: 'Session not found' }, 404);
   }
 
-  const jsonlPath = resolveJsonlPath(row.appProjectDir, row.cwd, row.claudeSessionId, row.runtime, row.startedAt, row.status);
+  const jsonlPath = resolveJsonlPath(row.appProjectDir, row.cwd, row.claudeSessionId, row.runtime, row.startedAt, row.status, id);
   if (!jsonlPath || !existsSync(jsonlPath)) {
     return c.json({ error: 'JSONL file not found' }, 404);
   }

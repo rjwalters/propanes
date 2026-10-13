@@ -1,6 +1,6 @@
 import WebSocket from 'ws';
 import * as os from 'node:os';
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'node:fs';
 import * as path from 'node:path';
 import * as pty from 'node-pty';
 import { execSync } from 'node:child_process';
@@ -11,6 +11,7 @@ import type {
   LauncherSessionStarted,
   LauncherSessionOutput,
   LauncherSessionEnded,
+  LauncherSessionPrUrls,
   HarnessStatusUpdate,
   ServerToLauncherMessage,
   LauncherCapabilities,
@@ -19,6 +20,8 @@ import type {
   LaunchHarnessSession,
   ImportSessionFiles,
   ImportSessionFilesResult,
+  ImportAttachments,
+  ImportAttachmentsResult,
   ExportSessionFiles,
   ExportSessionFilesResult,
   ReadSessionJsonl,
@@ -42,10 +45,12 @@ import {
   resolveSessionJsonlPath,
   listJsonlFiles,
   collectJsonlUnits,
+  jsonlCursorNeedsReset,
   readJsonlFileDelta,
   filterJsonlLines,
   type JsonlUnit,
 } from './jsonl-utils.js';
+import { newTranscriptCursor, scanTranscriptForPrUrls, type TranscriptScanCursor } from './pr-transcript-scan.js';
 
 const SERVER_WS_URL = process.env.SERVER_WS_URL || 'ws://localhost:3001/ws/launcher';
 const LAUNCHER_ID = process.env.LAUNCHER_ID || `launcher-${os.hostname()}`;
@@ -56,6 +61,8 @@ const MACHINE_ID = process.env.MACHINE_ID || undefined;
 const LAUNCHER_VERSION = (globalThis as any).__LAUNCHER_VERSION__ || '0.1.0';
 
 const MAX_OUTPUT_LOG = 500 * 1024;
+// How often a running agent's transcript is re-read for PR URLs.
+const PR_SCAN_INTERVAL_MS = 10_000;
 
 interface LocalSession {
   sessionId: string;
@@ -64,6 +71,50 @@ interface LocalSession {
   totalBytes: number;
   outputSeq: number;
   status: 'running' | 'completed' | 'failed' | 'killed';
+  /** Where this agent's transcript lives, for PR detection. Unset for harness (docker exec) sessions. */
+  transcript?: {
+    cwd: string;
+    runtime: AgentRuntime;
+    claudeSessionId: string;
+    startedAt: string;
+    cursor: TranscriptScanCursor;
+    /** URLs already sent to the server, so each is reported once. */
+    reported: Set<string>;
+  };
+  prScanTimer?: ReturnType<typeof setInterval>;
+}
+
+/** Read the transcript since the last scan and report any PR URLs not yet sent. */
+function reportTranscriptPrUrls(session: LocalSession, final: boolean): void {
+  const t = session.transcript;
+  if (!t) return;
+  try {
+    const jsonlPath = resolveSessionJsonlPath(
+      t.cwd,
+      t.cwd,
+      t.runtime,
+      t.claudeSessionId,
+      t.startedAt,
+      final ? session.status : 'running',
+      process.env.AGENT_HOME || os.homedir(),
+      final ? null : session.ptyProcess.pid,
+    );
+    const fresh = scanTranscriptForPrUrls(jsonlPath, t.cursor, final).filter((u) => !t.reported.has(u));
+    if (!fresh.length) return;
+    for (const u of fresh) t.reported.add(u);
+    const msg: LauncherSessionPrUrls = { type: 'launcher_session_pr_urls', sessionId: session.sessionId, prUrls: fresh };
+    sendToServer(msg);
+  } catch (err) {
+    console.error(`[launcher] transcript PR scan failed for ${session.sessionId}:`, err);
+  }
+}
+
+function stopTranscriptPrScan(session: LocalSession): void {
+  if (session.prScanTimer) {
+    clearInterval(session.prScanTimer);
+    session.prScanTimer = undefined;
+  }
+  reportTranscriptPrUrls(session, true);
 }
 
 const sessions = new Map<string, LocalSession>();
@@ -293,6 +344,20 @@ function spawnSession(params: {
   };
   sessions.set(sessionId, session);
 
+  // A resume keeps writing to the resumed UUID's transcript.
+  const transcriptId = claudeSessionId || resumeSessionId;
+  if (transcriptId) {
+    session.transcript = {
+      cwd,
+      runtime,
+      claudeSessionId: transcriptId,
+      startedAt: new Date().toISOString(),
+      cursor: newTranscriptCursor(),
+      reported: new Set(),
+    };
+    session.prScanTimer = setInterval(() => reportTranscriptPrUrls(session, false), PR_SCAN_INTERVAL_MS);
+  }
+
   const started: LauncherSessionStarted = {
     type: 'launcher_session_started',
     sessionId,
@@ -312,6 +377,7 @@ function spawnSession(params: {
   ptyProcess.onExit(({ exitCode }) => {
     session.status = exitCode === 0 ? 'completed' : 'failed';
     sendSequenced(session, { kind: 'exit', exitCode, status: session.status });
+    stopTranscriptPrScan(session);
 
     const ended: LauncherSessionEnded = {
       type: 'launcher_session_ended',
@@ -370,6 +436,49 @@ function handleImportSessionFiles(msg: ImportSessionFiles): void {
       ok: false,
       jsonlFilesWritten: 0,
       artifactFilesWritten: 0,
+      error: err.message,
+    };
+    sendToServer(result);
+  }
+}
+
+// Land feedback attachments on this machine so the /tmp/<filename> paths the
+// server baked into the prompt resolve here too. Filenames are server-minted
+// ULIDs, but they arrive over the wire — refuse anything with a path separator
+// so a hostile filename can't escape destDir.
+function handleImportAttachments(msg: ImportAttachments): void {
+  const { sessionId, destDir, files } = msg;
+  const written: string[] = [];
+  try {
+    mkdirSync(destDir, { recursive: true });
+    for (const f of files) {
+      const base = path.basename(f.filename);
+      if (!base || base !== f.filename || base === '.' || base === '..') {
+        console.warn(`[launcher] Skipping attachment with unsafe filename: ${f.filename}`);
+        continue;
+      }
+      const target = path.join(destDir, base);
+      // Replace rather than write through: if a launcher shares a host with the
+      // server, the destination may already be the server's symlink into its
+      // uploads dir, and writing through it would edit the original.
+      try { unlinkSync(target); } catch { /* nothing there */ }
+      writeFileSync(target, Buffer.from(f.contentBase64, 'base64'));
+      written.push(target);
+    }
+    const result: ImportAttachmentsResult = {
+      type: 'import_attachments_result',
+      sessionId,
+      ok: true,
+      written,
+    };
+    sendToServer(result);
+    console.log(`[launcher] Imported ${written.length} attachment(s) for session ${sessionId} into ${destDir}`);
+  } catch (err: any) {
+    const result: ImportAttachmentsResult = {
+      type: 'import_attachments_result',
+      sessionId,
+      ok: false,
+      written,
       error: err.message,
     };
     sendToServer(result);
@@ -471,6 +580,7 @@ function handleReadSessionJsonl(msg: ReadSessionJsonl): void {
       msg.startedAt,
       msg.status,
       process.env.AGENT_HOME || os.homedir(),
+      sessions.get(msg.targetSessionId)?.ptyProcess.pid,
     );
     if (!jsonlPath || !existsSync(jsonlPath)) {
       sendToServer(pending());
@@ -500,7 +610,7 @@ function handleReadSessionJsonl(msg: ReadSessionJsonl): void {
     }
 
     const offsets = decodeJsonlCursor(msg.cursor);
-    let reset = offsets === null;
+    let reset = jsonlCursorNeedsReset(offsets, units);
     const readUnits = () => {
       const newOffsets: Record<string, number> = {};
       const chunks: Array<{ key: string; subagentId?: string; lines: string[] }> = [];
@@ -788,6 +898,10 @@ function handleServerMessage(msg: ServerToLauncherMessage): void {
       handleImportSessionFiles(msg);
       break;
 
+    case 'import_attachments':
+      handleImportAttachments(msg);
+      break;
+
     case 'export_session_files':
       handleExportSessionFiles(msg);
       break;
@@ -912,6 +1026,10 @@ function handleServerMessage(msg: ServerToLauncherMessage): void {
       try {
         const filename = path.basename(msg.filename || 'file');
         const destPath = path.join(os.tmpdir(), filename);
+        // Replace rather than write through. When a launcher shares a host with
+        // the API server, the destination is already the server's symlink into
+        // its uploads dir, and writing through it would edit the stored original.
+        try { unlinkSync(destPath); } catch { /* nothing there */ }
         writeFileSync(destPath, Buffer.from(msg.contentBase64, 'base64'));
         const result: WriteSessionFileResult = { type: 'write_file_result', sessionId: msg.sessionId, ok: true, path: destPath };
         sendToServer(result);

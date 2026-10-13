@@ -19,6 +19,8 @@ import { PopupMenu } from '../pickers/PopupMenu.js';
 import { unreadNotificationCount, openNotificationCenter } from '../../lib/notifications.js';
 import { ChiefOfStaffToggle } from '../cos/ChiefOfStaffBubble.js';
 import { isMobile } from '../../lib/viewport.js';
+import { NavIcon } from '../ui/NavIcon.js';
+import { alphaFeaturesEnabled } from '../../lib/settings.js';
 
 function getSessionMruLabel(sessionId: string, sessionMap: Map<string, any>): string {
   const custom = getSessionLabel(sessionId);
@@ -92,7 +94,7 @@ export function ControlBar() {
         class="control-bar-btn control-bar-app-btn"
         onClick={() => setAppDropdown(!appDropdown)}
       >
-        <span class="control-bar-icon">{'\u{1F4BB}'}</span>
+        <span class="control-bar-icon"><NavIcon name="app" /></span>
         {app?.name || 'Select App'}
         <span class="control-bar-caret">{'\u25BE'}</span>
       </button>
@@ -202,7 +204,7 @@ export function ControlBar() {
         onClick={() => spawnTerminal(appId)}
         title="New terminal"
       >
-        <span class="control-bar-icon">{'\u{1F4DF}'}</span>
+        <span class="control-bar-icon"><NavIcon name="terminal" /></span>
         Terminal
       </button>
 
@@ -268,21 +270,22 @@ export function ControlBar() {
         title="Search (Cmd+K)"
         aria-label="Search"
       >
-        <span class="control-bar-icon">{'\u{1F50D}'}</span>
+        <span class="control-bar-icon"><NavIcon name="search" /></span>
       </button>
 
       <button
         class="control-bar-btn control-bar-notif-btn"
         onClick={openNotificationCenter}
         title="Notifications"
+        aria-label="Notifications"
       >
-        <span class="control-bar-icon">{'\u{1F514}'}</span>
+        <span class="control-bar-icon"><NavIcon name="bell" /></span>
         {unreadNotificationCount.value > 0 && (
           <span class="control-bar-notif-badge">{unreadNotificationCount.value}</span>
         )}
       </button>
 
-      <ChiefOfStaffToggle />
+      {alphaFeaturesEnabled.value && <ChiefOfStaffToggle />}
     </div>
   );
 }

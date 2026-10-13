@@ -1,11 +1,32 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
-import { JsonOutputParser, type ParsedMessage } from './output-parser.js';
-import { CodexOutputParser } from './codex-output-parser.js';
+import { type ParsedMessage } from './output-parser.js';
+import { TranscriptAccumulator } from './transcript-accumulator.js';
 import { api } from './api.js';
 import { allSessions, exitedSessions } from './sessions.js';
 import { isMobile } from './viewport.js';
 
 const TERMINAL_STATUSES = new Set(['completed', 'exited', 'failed', 'deleted', 'archived', 'killed']);
+
+// Statuses that mean "the request itself was too big", i.e. the cursor is at
+// fault rather than the transcript: 413 payload, 414 URI, 431 headers.
+const CURSOR_REJECTION_STATUSES = new Set([413, 414, 431]);
+const isCursorRejection = (status: unknown) =>
+  typeof status === 'number' && CURSOR_REJECTION_STATUSES.has(status);
+
+/** Never render a bare `HTTP 431` at the operator — a status code alone tells
+ *  them nothing about what broke or whether it will recover. */
+function describeTranscriptError(err: any, polling: boolean): string {
+  const retry = polling ? ' Retrying on the next poll…' : ' Reopen the view to try again.';
+  const status = err?.status;
+  if (isCursorRejection(status)) {
+    return `The server rejected this transcript request as too large.${retry}`;
+  }
+  const msg = err?.message || String(err);
+  if (/^HTTP \d+$/.test(msg)) {
+    return `Couldn't load the transcript (${msg}).${retry}`;
+  }
+  return msg;
+}
 
 export interface UseTranscriptStreamOpts {
   /** When set, pass `?file=` to the JSONL endpoint to filter to one transcript
@@ -46,8 +67,8 @@ export interface TranscriptStreamState {
  *    multi-MB JSONL parses freeze Safari.
  *  - Polls are differential: an opaque per-file byte-offset cursor is sent
  *    back to the server, which returns only newly appended lines. The merged
- *    transcript is rebuilt locally from per-file buffers because subagent
- *    lines interleave mid-stream (the merge is not append-only).
+ *    transcript is assembled from incremental per-file parsers because
+ *    subagent lines interleave mid-stream (the merge is not append-only).
  *  - In-flight guard prevents request stacking on slow servers — the JSONL
  *    endpoint walks all continuations + subagents per call.
  */
@@ -58,11 +79,10 @@ export function useTranscriptStream(
   const [messages, setMessages] = useState<ParsedMessage[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  // Differential-update state: per-file line buffers + the server's merge
-  // order + the opaque cursor. The merged transcript is rebuilt locally from
-  // these, so each poll only downloads lines appended since the last one.
-  const buffers = useRef<Map<string, string>>(new Map());
-  const order = useRef<string[]>([]);
+  // Differential-update state: one incremental parser per physical file plus
+  // the opaque byte cursor. This avoids reparsing an ever-growing transcript
+  // after every small poll.
+  const accumulator = useRef(new TranscriptAccumulator());
   const cursor = useRef<string | null>(null);
 
   const sessionRecord = allSessions.value.find((s: any) => s.id === sessionId);
@@ -87,12 +107,18 @@ export function useTranscriptStream(
 
     // Reset on identity change so the previous session's tail doesn't bleed
     // into the new one mid-fetch.
-    buffers.current = new Map();
-    order.current = [];
+    accumulator.current = new TranscriptAccumulator();
     cursor.current = null;
     setMessages([]);
     setLoading(true);
     setError(null);
+
+    // No session yet (empty id while a view mounts before its session
+    // resolves) — polling would hit /agent-sessions//jsonl and 404.
+    if (!sessionId) {
+      setLoading(false);
+      return () => { cancelled = true; };
+    }
 
     // No transcript will ever exist — don't poll an endpoint that can only
     // answer `pending`. If the session record later gains a claudeSessionId /
@@ -106,11 +132,26 @@ export function useTranscriptStream(
       if (inFlight) return;
       inFlight = true;
       try {
-        const delta = await api.getJsonlDelta(sessionId, {
-          fileFilter: fileFilter || undefined,
-          tail: tailLines,
-          cursor: cursor.current,
-        });
+        let delta;
+        try {
+          delta = await api.getJsonlDelta(sessionId, {
+            fileFilter: fileFilter || undefined,
+            tail: tailLines,
+            cursor: cursor.current,
+          });
+        } catch (err: any) {
+          // A cursor the server won't accept (too large for an intermediate
+          // proxy, stale encoding after a deploy) must not strand the view on
+          // an error wall — drop it and ask for a fresh full snapshot once.
+          if (!cursor.current || !isCursorRejection(err?.status)) throw err;
+          cursor.current = null;
+          accumulator.current = new TranscriptAccumulator();
+          delta = await api.getJsonlDelta(sessionId, {
+            fileFilter: fileFilter || undefined,
+            tail: tailLines,
+            cursor: null,
+          });
+        }
         if (cancelled) return;
         if (delta.pending) {
           // Transcript not on disk (yet) — the server answers 200 + pending
@@ -119,30 +160,16 @@ export function useTranscriptStream(
           // runs, empty view once it's done. Buffers/cursor stay untouched in
           // case the file reappears.
           setError(null);
-          setLoading(!isSessionDone && buffers.current.size === 0);
+          setLoading(!isSessionDone && !accumulator.current.hasMessages);
           return;
         }
         cursor.current = delta.cursor;
-        order.current = delta.order;
-        if (delta.reset) buffers.current = new Map();
-        for (const f of delta.files) {
-          const prev = buffers.current.get(f.key);
-          buffers.current.set(f.key, prev ? prev + '\n' + f.lines : f.lines);
-        }
         if (!delta.reset && delta.files.length === 0) {
           // Nothing appended since the last poll — keep the current parse.
           setLoading(false);
           return;
         }
-        const text = order.current
-          .map(k => buffers.current.get(k))
-          .filter(Boolean)
-          .join('\n');
-        const parser = runtime === 'codex'
-          ? new CodexOutputParser()
-          : new JsonOutputParser();
-        parser.feed(text + '\n');
-        setMessages(parser.getMessages());
+        setMessages(accumulator.current.apply(runtime, delta.order, delta.files, delta.reset));
         setError(null);
         setLoading(false);
       } catch (err: any) {
@@ -159,7 +186,7 @@ export function useTranscriptStream(
           setError(null);
           setLoading(false);
         } else {
-          setError(err?.message || String(err));
+          setError(describeTranscriptError(err, !isSessionDone && pollMs > 0));
           setLoading(false);
         }
       } finally {

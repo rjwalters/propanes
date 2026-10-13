@@ -1,3 +1,6 @@
+// Must be the first import: patches fetch/WS/EventSource with the mount
+// prefix before any other module can issue a request.
+import { serverPath } from './lib/base-path.js';
 import { render } from 'preact';
 import { App } from './components/shell/App.js';
 import './lib/settings.js';
@@ -8,6 +11,8 @@ import { UpdateBanner } from './components/ui/UpdateBanner.js';
 import { isEmbedded, isCompanion } from './lib/state.js';
 import '@xterm/xterm/css/xterm.css';
 import './app.css';
+import './workspace-design.css';
+import './conversation-theme.css';
 
 declare global {
   interface Window {
@@ -39,13 +44,22 @@ async function resolveAdminWidgetApiKey(): Promise<string | undefined> {
   if (injected && injected !== ADMIN_KEY_SENTINEL) return injected;
 
   try {
-    const res = await fetch('/api/v1/admin/applications');
+    const token = localStorage.getItem('pw-admin-token');
+    // The login screen also mounts the feedback widget. Avoid probing an
+    // admin-only endpoint until an admin session actually exists.
+    if (!token) return undefined;
+    const res = await fetch('/api/v1/admin/applications', {
+      headers: { Authorization: `Bearer ${token}` },
+    });
     if (!res.ok) return undefined;
     const apps = await res.json() as Array<{ name?: string; apiKey?: string; projectDir?: string }>;
+    // Mirror the server's admin-app match (server/src/admin-app.ts): the row's
+    // name casing drifts ("ProPanes Admin") and the widget must not guess
+    // among several apps — that files admin feedback into the wrong one.
     const adminApp =
-      apps.find((app) => app.name === 'Propanes Admin') ||
-      apps.find((app) => typeof app.projectDir === 'string' && /\/propanes\/?$/.test(app.projectDir)) ||
-      apps[0];
+      apps.find((app) => typeof app.name === 'string' && /^\s*pro\s*panes(\s+admin)?\s*$/i.test(app.name)) ||
+      apps.find((app) => typeof app.projectDir === 'string' && /\/propanes\/?$/i.test(app.projectDir)) ||
+      (apps.length === 1 ? apps[0] : undefined);
     return adminApp?.apiKey;
   } catch {
     return undefined;
@@ -54,8 +68,8 @@ async function resolveAdminWidgetApiKey(): Promise<string | undefined> {
 
 async function installAdminFeedbackWidget() {
   const widgetScript = document.createElement('script');
-  widgetScript.src = '/widget/propanes.js';
-  widgetScript.dataset.endpoint = '/api/v1/feedback';
+  widgetScript.src = serverPath('/widget/propanes.js');
+  widgetScript.dataset.endpoint = serverPath('/api/v1/feedback');
   widgetScript.dataset.mode = 'always';
   widgetScript.dataset.position = 'bottom-right';
   const appKey = await resolveAdminWidgetApiKey();

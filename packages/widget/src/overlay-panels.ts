@@ -18,7 +18,7 @@ const PANEL_CONFIGS: Record<PanelType, PanelConfig> = {
   detail: { icon: '\u{1F4CB}', title: 'Feedback Detail', path: (a, p) => `/app/${a}/feedback/${p}`, width: 650, height: 600 },
   sessions: { icon: '\u26A1', title: 'Sessions', path: (a, p) => p ? `/app/${a}/sessions/${p}` : `/app/${a}/sessions`, width: 650, height: 500 },
   files: { icon: '\u{1F4C2}', title: 'Files', path: (a) => `/app/${a}/sessions`, width: 650, height: 500 },
-  settings: { icon: '\u2699', title: 'Settings', path: () => '/settings/applications', width: 550, height: 500 },
+  settings: { icon: '\u2699', title: 'Settings', path: () => '/settings/preferences', width: 550, height: 500 },
   terminal: { icon: '\u{1F4BB}', title: 'Terminal', path: (a) => `/app/${a}/sessions`, width: 750, height: 500 },
   workbench: { icon: '\u2B1A', title: 'ProPanes Overlay', path: (a) => `/app/${a}/sessions`, width: 900, height: 600, embedMode: 'workbench' },
   cos: { icon: '★', title: 'Ops', path: () => '/', width: 480, height: 620, embedMode: 'cos' },
@@ -55,6 +55,11 @@ const MIN_SCALE = 0.4;
 const MAX_SCALE = 2.5;
 
 const PERSIST_KEY = 'pw-workbench-layout';
+export const ALPHA_FEATURES_KEY = 'pw-alpha-features';
+
+export function alphaFeaturesEnabled(): boolean {
+  try { return localStorage.getItem(ALPHA_FEATURES_KEY) === 'true'; } catch { return false; }
+}
 const DOCK_SNAP_DISTANCE = 40;
 
 let nextZ = 2147483600;
@@ -170,6 +175,50 @@ export class OverlayPanelManager {
     }
 
     return id;
+  }
+
+  /**
+   * Re-route an existing panel's iframe to a new hash route. The embed query
+   * string is kept identical so only the fragment changes — the browser
+   * performs an in-place fragment navigation and the admin SPA's hash router
+   * picks it up without a full reload. Returns false if the panel is gone
+   * (user closed it).
+   */
+  navigatePanel(id: string, type: PanelType, opts?: { param?: string; appId?: string }): boolean {
+    const state = this.panels.get(id);
+    if (!state) return false;
+    const config = PANEL_CONFIGS[type];
+    const appId = opts?.appId || this.appId;
+    const hashRoute = config.path(appId, opts?.param);
+    const embedMode = config.embedMode || 'true';
+    state.iframe.src = `${this.adminBaseUrl}?embed=${embedMode}&appId=${encodeURIComponent(appId)}#${hashRoute}`;
+    this.bringToFront(id);
+    return true;
+  }
+
+  /**
+   * Show (message) or clear (null) a slim status ribbon over the top of a
+   * panel's iframe — used e.g. while a freshly dispatched session is still
+   * spinning up. Deliberately a ribbon rather than a full veil so the iframe
+   * underneath (session list, or the login form when un-authed) stays usable.
+   */
+  setPanelStatus(id: string, message: string | null) {
+    const state = this.panels.get(id);
+    if (!state) return;
+    const wrap = state.el.querySelector('.pw-overlay-iframe-wrap');
+    if (!wrap) return;
+    let ribbon = wrap.querySelector('.pw-overlay-status') as HTMLElement | null;
+    if (!message) {
+      ribbon?.remove();
+      return;
+    }
+    if (!ribbon) {
+      ribbon = document.createElement('div');
+      ribbon.className = 'pw-overlay-status';
+      ribbon.innerHTML = '<span class="pw-overlay-status-spinner"></span><span class="pw-overlay-status-text"></span>';
+      wrap.appendChild(ribbon);
+    }
+    (ribbon.querySelector('.pw-overlay-status-text') as HTMLElement).textContent = message;
   }
 
   /** Open or focus the workbench panel */
@@ -300,6 +349,12 @@ export class OverlayPanelManager {
     } else if (data.type === 'pw-embed-gesture') {
       // Two-finger pan / pinch-zoom from inside the iframe
       this.handleGesture(e, data);
+    } else if (data.type === 'pw-embed-prefs') {
+      // Browser-local admin preferences mirrored into the host origin so the
+      // widget's admin menu can honor them on cross-origin host pages too.
+      if (typeof data.alphaFeatures === 'boolean') {
+        try { localStorage.setItem(ALPHA_FEATURES_KEY, String(data.alphaFeatures)); } catch { /* ignore */ }
+      }
     }
   }
 

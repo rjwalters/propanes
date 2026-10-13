@@ -1,5 +1,6 @@
 import { WebSocket as WsWebSocket } from 'ws';
 import { eq } from 'drizzle-orm';
+import { ViewerSizes } from './viewer-sizes.js';
 import { db, schema } from './db/index.js';
 import type { AgentRuntime, PermissionProfile, InputToSession, ResizeSessionRequest } from '@propanes/shared';
 import {
@@ -46,12 +47,15 @@ const launcherSessionAdmins = new Map<string, Set<WsWebSocket>>();
 // single shared resource but every browser/pane attaches at its own viewport
 // size, and — unlike local sessions, where session-service sees a distinct
 // upstream socket per browser — the launcher receives all viewers' resizes
-// multiplexed over one WS and can't tell them apart. So we do the "largest
-// attached viewer wins" reconciliation here (the last point where per-browser
-// identity exists) and forward only the max to the launcher, mirroring the
-// local fix in session-service. Without this, a shorter concurrent viewer
-// shrinks the PTY and taller panes paint the TUI in only the top rows.
-const adminSizes = new Map<WsWebSocket, { cols: number; rows: number }>();
+// multiplexed over one WS and can't tell them apart. So the per-viewer
+// bookkeeping lives here (the last point where per-browser identity exists):
+// the newest request wins, a detaching viewer hands the PTY to the next most
+// recent one, and every viewer is told the grid to mirror. Same policy as
+// session-service for local sessions — see ViewerSizes.
+const adminSizes = new ViewerSizes<WsWebSocket>();
+// Last size forwarded to the launcher per session, so viewers are only told
+// about actual changes.
+const launcherPtySizes = new Map<string, { cols: number; rows: number }>();
 
 const MAX_PTY_COLS = 300;
 const MAX_PTY_ROWS = 120;
@@ -74,26 +78,26 @@ function extractResize(parsed: any): { cols: number; rows: number } | null {
   return null;
 }
 
-// Per-axis max of every attached viewer's recorded size for this session.
-function largestSizeForSession(sessionId: string): { cols: number; rows: number } | null {
+// Size the launcher PTY to the most recent request among this session's
+// attached viewers and tell all of them which grid to emulate.
+function applyLauncherSize(launcherId: string, sessionId: string): void {
   const admins = launcherSessionAdmins.get(sessionId);
-  if (!admins) return null;
-  let cols = 0, rows = 0;
-  for (const a of admins) {
-    const s = adminSizes.get(a);
-    if (!s) continue;
-    if (s.cols > cols) cols = s.cols;
-    if (s.rows > rows) rows = s.rows;
-  }
-  if (cols <= 0 || rows <= 0) return null;
-  return { cols, rows };
-}
-
-function sendResizeToLauncher(launcherId: string, sessionId: string, cols: number, rows: number): void {
+  if (!admins) return;
+  const size = adminSizes.latest(admins);
+  if (!size) return;
   const launcher = getLauncher(launcherId);
   if (launcher && launcher.ws.readyState === 1) {
-    const msg: ResizeSessionRequest = { type: 'resize_session', sessionId, cols, rows };
+    const msg: ResizeSessionRequest = { type: 'resize_session', sessionId, cols: size.cols, rows: size.rows };
     try { launcher.ws.send(JSON.stringify(msg)); } catch {}
+  }
+  const prev = launcherPtySizes.get(sessionId);
+  if (prev && prev.cols === size.cols && prev.rows === size.rows) return;
+  launcherPtySizes.set(sessionId, size);
+  const notice = JSON.stringify({ type: 'pty_size', sessionId, cols: size.cols, rows: size.rows });
+  for (const a of admins) {
+    if (a.readyState === 1) {
+      try { a.send(notice); } catch {}
+    }
   }
 }
 
@@ -269,16 +273,40 @@ export function detachAdmin(sessionId: string, ws: WsWebSocket): void {
     const admins = launcherSessionAdmins.get(sessionId);
     if (admins) {
       admins.delete(ws);
-      if (admins.size === 0) launcherSessionAdmins.delete(sessionId);
+      if (admins.size === 0) {
+        launcherSessionAdmins.delete(sessionId);
+        launcherPtySizes.delete(sessionId);
+      }
     }
-    // Drop this viewer's recorded size and shrink the launcher PTY back to the
-    // largest remaining viewer, so a closed large pane can't pin the PTY.
+    // Drop this viewer's recorded size and hand the launcher PTY to the next
+    // most recent viewer, so a closed pane doesn't pin the PTY to its size.
     if (adminSizes.delete(ws) && bridge.kind === 'launcher') {
-      const max = largestSizeForSession(sessionId);
-      if (max) sendResizeToLauncher(bridge.launcherId, sessionId, max.cols, max.rows);
+      applyLauncherSize(bridge.launcherId, sessionId);
     }
   }
   adminBridges.delete(ws);
+}
+
+/**
+ * Is this message an AgentTerminal liveness ping the main server should answer
+ * itself rather than forward upstream?
+ *
+ * A socket that died with its machine (laptop sleep, VPN drop, NAT rebind)
+ * stays in readyState OPEN in the browser for minutes — send() keeps
+ * succeeding while every keystroke disappears. The terminal pings; a missing
+ * pong is what tells it to reconnect instead of stranding the operator with a
+ * pane they have to reload the page to type into.
+ *
+ * The payload must be parsed, not pattern-matched: a user typing `ping` into a
+ * terminal produces an input message that contains the same bytes.
+ */
+export function isLivenessPing(data: string): boolean {
+  if (data.length > 256 || !data.includes('"ping"')) return false;
+  try {
+    return (JSON.parse(data) as { type?: unknown } | null)?.type === 'ping';
+  } catch {
+    return false;
+  }
 }
 
 export function forwardToService(ws: WsWebSocket, data: string): void {
@@ -309,14 +337,12 @@ export function forwardToService(ws: WsWebSocket, data: string): void {
     if (launcher && launcher.ws.readyState === 1) {
       try {
         const parsed = JSON.parse(data);
-        // Resize is reconciled across all attached viewers: record this
-        // viewer's size and forward the per-axis max, not the raw request, so a
-        // shorter concurrent pane can't shrink the shared PTY (see adminSizes).
+        // Resize is tracked per viewer so a detach can fall back to the next
+        // most recent one; the newest request is what the launcher gets.
         const resize = extractResize(parsed);
         if (resize) {
           adminSizes.set(ws, clampSize(resize.cols, resize.rows));
-          const max = largestSizeForSession(bridge.sessionId);
-          if (max) sendResizeToLauncher(bridge.launcherId, bridge.sessionId, max.cols, max.rows);
+          applyLauncherSize(bridge.launcherId, bridge.sessionId);
           return;
         }
         const msg: InputToSession = {
@@ -410,20 +436,25 @@ export async function killSession(sessionId: string, reason = 'main-server killS
   return true;
 }
 
-export async function cleanupOrphanedSessions(): Promise<void> {
-  const runningSessions = db
-    .select({ id: schema.agentSessions.id, launcherId: schema.agentSessions.launcherId })
-    .from(schema.agentSessions)
-    .where(eq(schema.agentSessions.status, 'running'))
-    .all();
+export interface LivenessContext {
+  activeSvcSessions: Set<string> | null;
+  serviceTmuxSessions: Set<string> | null;
+  tmuxAvailable: boolean | undefined;
+  launcherSessions: Set<string>;
+}
 
-  if (runningSessions.length === 0) return;
-
-  // Check which sessions are still alive in the session-service
-  // Returns null if the service is unreachable
+/**
+ * Snapshot the same three liveness signals cleanupOrphanedSessions uses
+ * (session-service's active/tmux session lists, connected-launcher session
+ * lists), taken fresh at call time. Shared so the restart/restore queue
+ * (restore-queue.ts) re-checks liveness with the exact same rules instead of
+ * duplicating them — and so a session mis-marked during a transient blip in
+ * the original sweep can be recognized as alive later, when the queue is
+ * actually viewed.
+ */
+export async function snapshotLiveness(): Promise<LivenessContext> {
   const serviceHealth = await getSessionServiceHealthSnapshot();
 
-  // Check which sessions are on connected launchers
   const launcherSessions = new Set<string>();
   for (const launcher of listLaunchers()) {
     if (launcher.ws.readyState === 1) {
@@ -433,31 +464,59 @@ export async function cleanupOrphanedSessions(): Promise<void> {
     }
   }
 
-  const activeSvcSessions = serviceHealth ? new Set(serviceHealth.sessions || []) : null;
-  const serviceTmuxSessions = serviceHealth?.tmuxSessions ? new Set(serviceHealth.tmuxSessions) : null;
+  return {
+    activeSvcSessions: serviceHealth ? new Set(serviceHealth.sessions || []) : null,
+    serviceTmuxSessions: serviceHealth?.tmuxSessions ? new Set(serviceHealth.tmuxSessions) : null,
+    tmuxAvailable: serviceHealth?.tmuxAvailable,
+    launcherSessions,
+  };
+}
+
+/**
+ * Is this session alive right now per `ctx`? `null` means inconclusive (the
+ * service was unreachable, or reports tmux unavailable) rather than "dead" —
+ * callers must decide separately whether inconclusive counts as alive for
+ * their purpose (cleanupOrphanedSessions treats it as "don't touch";
+ * restore-queue treats it as "not confirmed alive, still show it").
+ */
+export function isSessionAliveNow(
+  sessionId: string,
+  launcherId: string | null | undefined,
+  ctx: LivenessContext,
+): boolean | null {
+  if (ctx.activeSvcSessions?.has(sessionId)) return true;
+  // Session-service can see the backing tmux session even if it has not
+  // reattached yet — that's recoverable, not dead.
+  if (ctx.serviceTmuxSessions?.has(sessionId)) return true;
+  if (isSpriteSession(sessionId)) return true;
+  if (launcherId && ctx.launcherSessions.has(sessionId)) return true;
+  if (!ctx.activeSvcSessions) return null; // service unreachable: inconclusive
+  if (ctx.tmuxAvailable === false) return null; // tmux itself unavailable: inconclusive
+  return false;
+}
+
+export async function cleanupOrphanedSessions(): Promise<void> {
+  const runningSessions = db
+    .select({ id: schema.agentSessions.id, launcherId: schema.agentSessions.launcherId })
+    .from(schema.agentSessions)
+    .where(eq(schema.agentSessions.status, 'running'))
+    .all();
+
+  if (runningSessions.length === 0) return;
+
+  const ctx = await snapshotLiveness();
 
   const now = new Date().toISOString();
   for (const session of runningSessions) {
-    // Session-service confirms it's alive
-    if (activeSvcSessions?.has(session.id)) continue;
-    // Session-service can see the backing tmux session even if it has not
-    // reattached yet. Do not convert that to "failed"; leave it recoverable.
-    if (serviceTmuxSessions?.has(session.id)) continue;
-    // Sprite session still active
-    if (isSpriteSession(session.id)) continue;
-    // Launcher confirms it's alive
-    if (session.launcherId && launcherSessions.has(session.id)) continue;
-    // Session-service was unreachable, or it reports tmux as unavailable.
-    // Both cases are inconclusive, so do not mass-fail running DB rows.
-    if (!activeSvcSessions) continue;
-    if (serviceHealth?.tmuxAvailable === false) continue;
+    const alive = isSessionAliveNow(session.id, session.launcherId, ctx);
+    if (alive !== false) continue; // true (alive) or null (inconclusive): leave it
 
     appendSessionAuditMarker(
       session.id,
-      `main-server cleanupOrphanedSessions marked failed; activeService=false tmuxSession=${serviceTmuxSessions ? 'missing' : 'unknown'} launcherSession=${session.launcherId ? 'missing' : 'none'}`
+      `main-server cleanupOrphanedSessions marked failed; activeService=false tmuxSession=${ctx.serviceTmuxSessions ? 'missing' : 'unknown'} launcherSession=${session.launcherId ? 'missing' : 'none'}`
     );
     db.update(schema.agentSessions)
-      .set({ status: 'failed', completedAt: now })
+      .set({ status: 'failed', completedAt: now, failureReason: 'orphaned_restart' })
       .where(eq(schema.agentSessions.id, session.id))
       .run();
     updateFeedbackOnSessionEnd(session.id, 'failed');

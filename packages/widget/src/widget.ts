@@ -18,7 +18,7 @@ import { captureScreenshot, stopScreencastStream, type ScreenshotMethod } from '
 import { installShakeGesture } from './gesture-detector.js';
 import { SessionBridge } from './session.js';
 import { startPicker, type SelectedElementInfo } from './element-picker.js';
-import { OverlayPanelManager, type PanelType } from './overlay-panels.js';
+import { OverlayPanelManager, alphaFeaturesEnabled, type PanelType } from './overlay-panels.js';
 import { VoiceRecorder, type VoiceRecordingResult, type TimelineItem } from './voice-recorder.js';
 import {
   installWidgetConsoleBuffer,
@@ -104,6 +104,20 @@ function copyTextDeferred(textPromise: Promise<string>): Promise<void> {
     }
   }
   return fallback();
+}
+
+// Send-menu persistence. The Mode selector (submit/dispatch/yolo) and the
+// sticky Auto-dispatch checkbox are independent preferences with separate keys.
+const SEND_MODE_KEY = 'pw-dispatch-mode';
+const AUTO_DISPATCH_KEY = 'pw-auto-dispatch';
+type SendMode = 'submit' | 'dispatch' | 'yolo';
+
+function readSendMode(): SendMode {
+  try {
+    const v = localStorage.getItem(SEND_MODE_KEY);
+    if (v === 'submit' || v === 'dispatch' || v === 'yolo') return v;
+  } catch { /* ignore */ }
+  return 'dispatch';
 }
 
 // --- localStorage persistence for widget drafts ---
@@ -244,6 +258,12 @@ export class ProPanesElement {
   private pickerCleanup: (() => void) | null = null;
   private overlayManager: OverlayPanelManager;
   private appId: string;
+  // Guards handleSubmit against re-entry. All three entry points (Enter, the
+  // send button, the send-menu Send item) route through handleSubmit, and the
+  // POST's round-trip is long enough that rapid Enter/clicks would otherwise
+  // each read the still-populated input and fire a duplicate submit before the
+  // first cleared it.
+  private isSubmitting = false;
   // Hydrated in constructor once appId + sessionId are known. Reads from the
   // (appId, sessionId)-scoped key first, then falls back to the legacy
   // unscoped 'pw-widget-draft' key so existing drafts aren't lost on upgrade.
@@ -261,7 +281,10 @@ export class ProPanesElement {
   private countdownTimer: ReturnType<typeof setInterval> | null = null;
   private gestureCleanup: (() => void) | null = null;
   private gestureToastTimer: ReturnType<typeof setTimeout> | null = null;
-  private dispatchMode: 'off' | 'once' | 'auto' = 'off';
+  private dispatchMode: 'off' | 'auto' = 'off';
+  // One-shot override chosen from the send menu's Send button. It applies to
+  // the next submit only and never touches the persisted Auto-dispatch flag.
+  private dispatchOnce: boolean | null = null;
   private dispatchAgentOverride: string | null = null;
   private pendingPermissionProfile: 'interactive-yolo' | null = null;
   private cachedAgents: Array<Record<string, any>> = [];
@@ -433,8 +456,15 @@ export class ProPanesElement {
 
   private loadDispatchMode() {
     try {
-      const stored = localStorage.getItem('pw-dispatch-mode');
-      if (stored === 'auto') this.dispatchMode = 'auto';
+      if (localStorage.getItem(AUTO_DISPATCH_KEY) === '1') {
+        this.dispatchMode = 'auto';
+      } else if (localStorage.getItem(SEND_MODE_KEY) === 'auto') {
+        // Legacy: the auto flag used to share the send-mode key, so any
+        // Mode/Send interaction clobbered it. Migrate to the dedicated key.
+        this.dispatchMode = 'auto';
+        localStorage.setItem(AUTO_DISPATCH_KEY, '1');
+        localStorage.setItem(SEND_MODE_KEY, 'dispatch');
+      }
     } catch { /* ignore */ }
   }
 
@@ -503,13 +533,13 @@ export class ProPanesElement {
     } catch { /* ignore */ }
   }
 
-  private setDispatchMode(mode: 'off' | 'once' | 'auto') {
+  private setDispatchMode(mode: 'off' | 'auto') {
     this.dispatchMode = mode;
     try {
       if (mode === 'auto') {
-        localStorage.setItem('pw-dispatch-mode', 'auto');
+        localStorage.setItem(AUTO_DISPATCH_KEY, '1');
       } else {
-        localStorage.removeItem('pw-dispatch-mode');
+        localStorage.removeItem(AUTO_DISPATCH_KEY);
       }
     } catch { /* ignore */ }
 
@@ -599,8 +629,9 @@ export class ProPanesElement {
     modeLabel.textContent = 'Mode:';
     modeLabel.style.cssText = 'font-size:11px;color:#94a3b8;flex-shrink:0';
     const modeSel = document.createElement('select');
+    modeSel.setAttribute('aria-label', 'Send mode');
     modeSel.className = 'pw-send-menu-target-select';
-    const savedMode = localStorage.getItem('pw-dispatch-mode') || 'dispatch';
+    const savedMode = readSendMode();
     modeSel.innerHTML = [
       '<option value="submit">Submit only</option>',
       '<option value="dispatch">Dispatch</option>',
@@ -610,8 +641,9 @@ export class ProPanesElement {
     modeSel.addEventListener('pointerdown', (e) => e.stopPropagation());
     modeSel.addEventListener('click', (e) => e.stopPropagation());
     modeSel.addEventListener('change', () => {
-      localStorage.setItem('pw-dispatch-mode', modeSel.value);
+      localStorage.setItem(SEND_MODE_KEY, modeSel.value);
       agentSel.options[0].textContent = modeSel.value === 'yolo' ? 'Auto' : 'Default';
+      sendBtn.disabled = modeSel.value !== 'submit' && !agentsAvailable;
     });
     modeRow.append(modeLabel, modeSel);
     menu.appendChild(modeRow);
@@ -623,6 +655,7 @@ export class ProPanesElement {
     agentLabel.textContent = 'Agent:';
     agentLabel.style.cssText = 'font-size:11px;color:#94a3b8;flex-shrink:0';
     const agentSel = document.createElement('select');
+    agentSel.setAttribute('aria-label', 'Agent');
     agentSel.className = 'pw-send-menu-target-select';
     agentSel.innerHTML = `<option value="">${savedMode === 'yolo' ? 'Auto' : 'Default'}</option>`;
     agentSel.value = localStorage.getItem('pw-dispatch-agent') || '';
@@ -641,13 +674,43 @@ export class ProPanesElement {
     agentSettingsLink.addEventListener('click', (e) => e.stopPropagation());
     agentRow.append(agentLabel, agentSel, agentSettingsLink);
     menu.appendChild(agentRow);
+    let agentsAvailable = false;
+    const agentHint = document.createElement('div');
+    agentHint.style.cssText = 'font-size:12px;color:#cbd5e1;padding:8px 12px;line-height:1.5;max-width:260px';
+    agentHint.textContent = 'Loading agents…';
+    agentHint.setAttribute('role', 'status');
+    menu.appendChild(agentHint);
+    const signInButton = document.createElement('button');
+    signInButton.className = 'pw-send-menu-item';
+    signInButton.textContent = 'Sign in to ProPanes';
+    signInButton.style.display = 'none';
+    signInButton.addEventListener('click', (e) => {
+      e.stopPropagation();
+      menu.remove();
+      this.overlayManager.openPanel('settings');
+    });
+    menu.appendChild(signInButton);
 
     // Populate agents from API
     const agentOrigin = this.apiBase();
     fetch(`${agentOrigin}/api/v1/admin/agents${this.appId ? `?appId=${this.appId}` : ''}`, { headers: this.adminAuthHeaders() })
-      .then(r => r.json())
+      .then(async r => {
+        if (r.status === 401 || r.status === 403) {
+          signInButton.style.display = '';
+          throw new Error('Sign in here to choose an agent. Your app and admin use separate browser sessions.');
+        }
+        if (!r.ok) throw new Error('Could not load agents. Close this menu and try again.');
+        return r.json();
+      })
       .then((agents: any[]) => {
-        if (!agents?.length) return;
+        if (!Array.isArray(agents)) throw new Error('Could not load agents. Close this menu and try again.');
+        if (!agents.length) {
+          agentHint.textContent = 'No agents yet. Open Agent settings (⚙) to add one, then reopen this menu. You can still choose Submit only to save feedback.';
+          return;
+        }
+        agentsAvailable = true;
+        agentHint.hidden = true;
+        sendBtn.disabled = false;
         this.cachedAgents = agents;
         for (const a of agents) {
           const opt = document.createElement('option');
@@ -660,7 +723,7 @@ export class ProPanesElement {
         }
         agentSel.value = localStorage.getItem('pw-dispatch-agent') || '';
       })
-      .catch(() => {});
+      .catch((err) => { agentHint.textContent = err.message || 'Could not load agents.'; });
 
     // Dispatch target selector
     const targetRow = document.createElement('div');
@@ -709,6 +772,7 @@ export class ProPanesElement {
 
     // Send button
     const sendBtn = document.createElement('button');
+    sendBtn.disabled = modeSel.value !== 'submit';
     sendBtn.className = 'pw-send-menu-item pw-send-menu-send-btn';
     sendBtn.textContent = 'Send';
     sendBtn.addEventListener('click', (e) => {
@@ -722,12 +786,11 @@ export class ProPanesElement {
         const agent = selectedAgent || this.pickYoloAgent(this.cachedAgents);
         this.dispatchAgentOverride = agent ? agent.id : null;
         this.pendingPermissionProfile = 'interactive-yolo';
-        this.setDispatchMode('once');
       } else {
         this.dispatchAgentOverride = selectedAgentId;
         this.pendingPermissionProfile = null;
-        this.setDispatchMode(selectedMode === 'dispatch' ? 'once' : 'off');
       }
+      this.dispatchOnce = selectedMode !== 'submit';
       menu.remove();
       this.handleSubmit();
     });
@@ -1132,6 +1195,8 @@ export class ProPanesElement {
   private renderTrigger() {
     const btn = document.createElement('button');
     btn.className = `pw-trigger ${this.config.position}`;
+    btn.setAttribute('aria-label', 'Open ProPanes prompt widget');
+    btn.title = 'Open ProPanes prompt widget';
     btn.innerHTML = `<svg viewBox="0 0 24 24"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H5.2L4 17.2V4h16v12z"/></svg>`;
     this.shadow.appendChild(btn);
 
@@ -1323,12 +1388,14 @@ export class ProPanesElement {
     // Workbench is a small icon, not a full-width row, so it sits next to the
     // others. Opening it routes through openWorkbench() to focus the existing
     // panel if one is already open.
-    type IconItem = { icon: string; label: string; onClick: () => void };
+    // Ops (CoS chat) is an alpha feature — only offered when the admin's
+    // "Alpha test new features" preference is on.
+    type IconItem = { icon: string; label: string; onClick: () => void; alpha?: boolean };
     const iconItems: IconItem[] = [
       { icon: '\u{1F4CB}', label: 'Feedback', onClick: () => this.overlayManager.openPanel('feedback') },
       { icon: '\u26A1', label: 'Sessions', onClick: () => this.overlayManager.openPanel('sessions') },
       { icon: '\u2B1A', label: 'ProPanes Overlay', onClick: () => this.overlayManager.openWorkbench() },
-      { icon: '\u2605', label: 'Ops', onClick: () => this.overlayManager.openPanel('cos') },
+      { icon: '\u2605', label: 'Ops', alpha: true, onClick: () => this.overlayManager.openPanel('cos') },
       { icon: '\u{1F4BB}', label: 'Terminal', onClick: () => {
           const opts: { launcherId?: string } = {};
           const stored = localStorage.getItem('pw-dispatch-target');
@@ -1339,7 +1406,9 @@ export class ProPanesElement {
     ];
     const iconRow = document.createElement('div');
     iconRow.className = 'pw-admin-more-row';
+    const showAlpha = alphaFeaturesEnabled();
     for (const item of iconItems) {
+      if (item.alpha && !showAlpha) continue;
       const btn = document.createElement('button');
       btn.className = 'pw-admin-option pw-admin-option-small';
       btn.innerHTML = `<span class="pw-admin-option-icon">${item.icon}</span>`;
@@ -1422,7 +1491,7 @@ export class ProPanesElement {
       <div class="pw-input-area">
         <div class="pw-attach-chips pw-hidden" id="pw-attach-chips"></div>
         <div class="pw-composer-row">
-          <textarea class="pw-textarea" id="pw-chat-input" placeholder="What's on your mind?" rows="1" autocomplete="off"></textarea>
+          <textarea class="pw-textarea" id="pw-chat-input" aria-label="Describe a change" placeholder="Describe a change to this app…" rows="1" autocomplete="off"></textarea>
           <div class="pw-toolbar">
             <span class="pw-camera-countdown pw-hidden" id="pw-camera-countdown"></span>
             ${this.sessionBridge.screenshotIncludeWidget ? `
@@ -3380,6 +3449,13 @@ export class ProPanesElement {
       return;
     }
 
+    // A submit is already in flight — ignore the extra Enter/click so we don't
+    // record duplicate feedback items (the send button also shows a spinner,
+    // but the guard is what actually prevents the duplicate).
+    if (this.isSubmitting) return;
+    this.isSubmitting = true;
+    this.setSendButtonBusy(true);
+
     // Console capture rides along inside the description as a fenced code
     // block so the agent gets it without needing a new server-side schema.
     // Mirrors how the admin InterruptBar appends "Recent browser console
@@ -3442,13 +3518,38 @@ export class ProPanesElement {
         errorEl.classList.remove('pw-hidden');
         input.disabled = false;
         input.focus();
+      } finally {
+        this.isSubmitting = false;
+        this.setSendButtonBusy(false);
       }
       return;
     }
 
-    const shouldDispatch = this.dispatchMode === 'auto' || this.dispatchMode === 'once';
-    if (this.dispatchMode === 'once') {
-      this.dispatchMode = 'off';
+    const shouldDispatch = this.dispatchOnce ?? this.dispatchMode === 'auto';
+    this.dispatchOnce = null;
+
+    // The persisted "⚡ YOLO" mode must bind at submit time, not only in the
+    // send menu's Send-button handler — otherwise an Enter / auto-dispatch
+    // submit with YOLO selected silently dispatched interactive-require with
+    // whatever agent was last saved.
+    if (shouldDispatch && !this.pendingPermissionProfile) {
+      let savedMode: string | null = null;
+      try {
+        savedMode = localStorage.getItem(SEND_MODE_KEY);
+      } catch {}
+      if (savedMode === 'yolo') {
+        this.pendingPermissionProfile = 'interactive-yolo';
+        // Mirror the send menu: an explicitly chosen agent keeps priority
+        // (yolo profile is forced onto it); auto-pick only when none is set.
+        let savedAgent: string | null = null;
+        try {
+          savedAgent = localStorage.getItem('pw-dispatch-agent');
+        } catch {}
+        if (!this.dispatchAgentOverride && !savedAgent) {
+          const agent = this.pickYoloAgent(this.cachedAgents);
+          if (agent) this.dispatchAgentOverride = agent.id;
+        }
+      }
     }
 
     // Screenshot-only submission (no description, no voice, no selected elements, no timeline):
@@ -3536,45 +3637,110 @@ export class ProPanesElement {
     } finally {
       this.dispatchAgentOverride = null;
       this.pendingPermissionProfile = null;
+      this.isSubmitting = false;
+      this.setSendButtonBusy(false);
     }
   }
 
-  // Poll the feedback record until its dispatch produces a session, then open
-  // that session on the current page. On the admin app itself we hash-swap to
-  // the /app/:appId/sessions/:sessionId deep link, which opens the sessions
-  // view scoped to this app and docks the session in the pane tree (instead of
-  // blowing away the layout with the standalone /session page). On any other
-  // host page we open the widget's Sessions overlay panel with the same route,
-  // so the list is filtered to this app and the dispatched session loads.
+  // Toggle the send button's in-flight state: disabled + a spinner in place of
+  // the paper-plane, so a submit visibly can't be re-fired. Targets both send
+  // button layouts (plain, and the dispatch send-group).
+  private setSendButtonBusy(busy: boolean) {
+    const btn = this.shadow.querySelector('#pw-send-btn') as HTMLButtonElement | null;
+    if (!btn) return;
+    btn.classList.toggle('pw-send-busy', busy);
+    btn.disabled = busy;
+  }
+
+  // Open the dispatched session on the current page. The session overlay is
+  // opened *immediately* — same as clicking the Sessions overlay button in the
+  // widget's icon row — with a loading ribbon, then we poll the feedback
+  // record until its dispatch produces a session id and route the panel to it.
+  // (Previously nothing opened until the poll resolved, so a slow-starting or
+  // unauthorized poll meant "Open Session" silently did nothing.)
+  //
+  // On the admin app itself we hash-swap to the /app/:appId/sessions[/:id]
+  // deep link, which opens the sessions view scoped to this app and docks the
+  // session in the pane tree (instead of blowing away the layout with the
+  // standalone /session page). On any other host page the overlay panel hosts
+  // the same route.
   private openDispatchedSession(feedbackId: string) {
     const base = this.apiBase();
-    const navigate = (sessionId: string) => {
-      try {
-        const adminOrigin = new URL(base).origin;
-        if (window.location.origin === adminOrigin && /\/admin\b/.test(window.location.pathname)) {
-          window.location.hash = `#/app/${this.appId}/sessions/${sessionId}`;
-          return;
-        }
-      } catch {}
-      this.overlayManager.openPanel('sessions', { param: sessionId });
+    let onAdminApp = false;
+    try {
+      const adminOrigin = new URL(base, window.location.href).origin;
+      onAdminApp = window.location.origin === adminOrigin && /\/admin\b/.test(window.location.pathname);
+    } catch {}
+
+    let panelId: string | null = null;
+    if (onAdminApp) {
+      window.location.hash = `#/app/${this.appId}/sessions`;
+    } else {
+      panelId = this.overlayManager.openPanel('sessions');
+      this.overlayManager.setPanelStatus(panelId, 'Starting agent session…');
+    }
+
+    const clearStatus = () => {
+      if (panelId) this.overlayManager.setPanelStatus(panelId, null);
     };
+    const navigate = (sessionId: string) => {
+      if (onAdminApp) {
+        window.location.hash = `#/app/${this.appId}/sessions/${sessionId}`;
+        return;
+      }
+      clearStatus();
+      // Panel gone = user closed it while the session was starting; treat
+      // that as a cancel rather than popping a fresh panel at them.
+      if (panelId) this.overlayManager.navigatePanel(panelId, 'sessions', { param: sessionId });
+    };
+
+    const currentToken = () => {
+      try {
+        return sessionStorage.getItem('pw-admin-token-overlay') || localStorage.getItem('pw-admin-token') || '';
+      } catch {
+        return '';
+      }
+    };
+
     const started = Date.now();
+    const DEADLINE_MS = 120000;
+    // Token that last got a 401/403. While it's unchanged there is no point
+    // re-hitting the endpoint (and spamming the console with 401s) — we idle
+    // until the overlay's login flow posts a fresh token via pw-embed-auth.
+    let deniedToken: string | null = null;
     const poll = async () => {
+      const expired = () => Date.now() - started >= DEADLINE_MS;
+      if (deniedToken !== null && currentToken() === deniedToken) {
+        if (expired()) clearStatus();
+        else setTimeout(poll, 1500);
+        return;
+      }
+      // Pin the token for this request so a fresh token arriving mid-fetch
+      // can't be mistakenly recorded as the denied one (which would park the
+      // poll forever with a good token in hand).
+      const tokenUsed = currentToken();
       try {
         const res = await fetch(`${base}/api/v1/admin/feedback/${feedbackId}`, {
-          headers: this.adminAuthHeaders(),
+          headers: tokenUsed ? { Authorization: `Bearer ${tokenUsed}` } : {},
         });
-        if (res.ok) {
+        if (res.status === 401 || res.status === 403) {
+          deniedToken = tokenUsed;
+          if (panelId) this.overlayManager.setPanelStatus(panelId, 'Sign in to open the session');
+        } else if (res.ok) {
           const item = await res.json();
           const match = /started:\s*([0-9A-Za-z]{20,})/.exec(item?.dispatchResponse || '');
           if (match && item?.dispatchStatus === 'running') {
             navigate(match[1]);
             return;
           }
-          if (item?.dispatchStatus === 'error') return;
+          if (item?.dispatchStatus === 'error') {
+            clearStatus();
+            return;
+          }
         }
       } catch {}
-      if (Date.now() - started < 20000) setTimeout(poll, 700);
+      if (expired()) clearStatus();
+      else setTimeout(poll, 700);
     };
     poll();
   }
@@ -3706,7 +3872,7 @@ export class ProPanesElement {
       if (!res.ok) {
         throw await apiResponseError(res);
       }
-      return res.json();
+      return this.readRecordedFeedback(res);
     } else {
       const res = await this.fetchWithContext(this.config.endpoint, {
         method: 'POST',
@@ -3717,8 +3883,28 @@ export class ProPanesElement {
       if (!res.ok) {
         throw await apiResponseError(res);
       }
-      return res.json();
+      return this.readRecordedFeedback(res);
     }
+  }
+
+  // The POST response body is the server's confirmation that the item was
+  // recorded — it echoes the created record with its `id`. A 2xx alone isn't
+  // enough: a reverse proxy or gateway in front of ProPanes can answer with an
+  // unexpected 2xx body (or none), which would otherwise read as success and
+  // make handleSubmit() clear the user's prompt on a phantom save. Treat a 2xx
+  // that doesn't parse to an object carrying an `id` as a failed submit, so the
+  // caller's catch keeps the typed prompt intact.
+  private async readRecordedFeedback(res: Response): Promise<{ id: string; [k: string]: unknown }> {
+    let body: unknown;
+    try {
+      body = await res.json();
+    } catch {
+      throw new Error('Feedback was not recorded — the server returned an unexpected response. Your text was kept.');
+    }
+    if (!body || typeof body !== 'object' || !(body as { id?: unknown }).id) {
+      throw new Error('Feedback was not recorded — the server did not confirm it. Your text was kept.');
+    }
+    return body as { id: string; [k: string]: unknown };
   }
 
   private async submitAppend(feedbackId: string, description: string) {

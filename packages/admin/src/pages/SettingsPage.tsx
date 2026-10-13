@@ -1,4 +1,6 @@
 import { useState, useEffect } from 'preact/hooks';
+import { alphaFeaturesEnabled } from '../lib/settings.js';
+import { terminalColor, type TerminalColor, structuredColor, type StructuredColor } from '../lib/settings.js';
 import { theme, setTheme, shortcutsEnabled, tooltipsEnabled, showTabs, arrowTabSwitching, multiDigitTabs, autoNavigateToFeedback, showHotkeyHints, autoJumpWaiting, autoJumpInterrupt, autoJumpDelay, autoOpenChildCompanions, inlineElementChipsEnabled, popoutMode, localBridgeUrl, sshConfigs, type Theme, type PopoutMode, type SshConfig } from '../lib/settings.js';
 import { perfOverlayEnabled, perfServerEnabled } from '../lib/perf.js';
 import { getAllShortcuts } from '../lib/shortcuts.js';
@@ -271,6 +273,40 @@ export function SettingsPage() {
               </button>
             ))}
           </div>
+        </div>
+
+        <div class="settings-section">
+          <h3>Terminal appearance</h3>
+          <div class="form-group">
+            <label for="terminal-color">PTY background</label>
+            <select id="terminal-color" value={terminalColor.value} onChange={e => { terminalColor.value = e.currentTarget.value as TerminalColor; }}>
+              <option value="dark-grey">Very dark grey · light grey (default)</option>
+              <option value="black">Black · white</option>
+              <option value="graphite">Graphite · soft grey</option>
+            </select>
+            <p class="settings-toggle-desc">Follows light/dark mode: the first shade applies in dark mode, the second in light mode. Updates open terminals without restarting sessions. Saved in this browser.</p>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <h3>Structured view appearance</h3>
+          <div class="form-group">
+            <label for="structured-color">Structured background</label>
+            <select id="structured-color" value={structuredColor.value} onChange={e => { structuredColor.value = e.currentTarget.value as StructuredColor; }}>
+              <option value="black">Black · white (default)</option>
+              <option value="charcoal">Charcoal · light grey</option>
+              <option value="workspace">Match workspace</option>
+            </select>
+            <p class="settings-toggle-desc">Applies to structured session transcripts and follows light/dark mode (first shade in dark mode, second in light mode). CoS chat follows the workspace appearance; the PTY shade is chosen above.</p>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <h3>Experimental features</h3>
+          <label class="settings-toggle-row">
+            <span><span class="settings-toggle-label">Alpha test new features</span><br /><span class="settings-toggle-desc">Enable experimental tools such as Flatter, the Ops (CoS) chat, and Review approvals. These features may change or be unstable. Off by default; saved in this browser.</span></span>
+            <span class="toggle-switch"><input type="checkbox" aria-label="Alpha test new features" checked={alphaFeaturesEnabled.value} onChange={e => { alphaFeaturesEnabled.value = e.currentTarget.checked; }} /><span class="toggle-slider" /></span>
+          </label>
         </div>
 
         <div class="settings-section">

@@ -4,6 +4,9 @@ import { timed, bindRouteSignal } from './perf.js';
 import { isolatedComponent } from './isolate.js';
 import { openPageView, openSettingsPanel } from './companion-state.js';
 import { initEmbedGestures } from './embed-gestures.js';
+import { COS_WORKSPACE_ID } from './app-id.js';
+import { alphaFeaturesEnabled } from './settings.js';
+export { COS_WORKSPACE_ID } from './app-id.js';
 
 // Embed mode detection
 const params = new URLSearchParams(window.location.search);
@@ -11,6 +14,8 @@ export const isWorkbench = signal(params.get('embed') === 'workbench');
 export const isCosEmbed = signal(params.get('embed') === 'cos');
 export const isEmbedded = signal(params.get('embed') === 'true' || isWorkbench.value || isCosEmbed.value);
 export const isCompanion = signal(params.get('companion') === 'true');
+// Widget overlay panels (`?embed=true`): PageView only, no pane tree or Layout.
+export const isPlainEmbed = params.get('embed') === 'true' && !isCompanion.value;
 const embedAppId = params.get('appId');
 
 if (isWorkbench.value) {
@@ -129,9 +134,6 @@ export async function loadApprovals(appId: string): Promise<typeof api.getApprov
     return { approvals: [] } as any;
   }
 }
-
-// CoS workspace constant — spans all apps, default when none registered.
-export const COS_WORKSPACE_ID = '__cos__';
 
 // Whenever the selected workspace changes, refresh its channel list.
 effect(() => {
@@ -256,7 +258,7 @@ function routeToViewId(route: string): string | null {
 // agent-settings link opening #/settings/agents in a new browser tab) are
 // silently swallowed whenever another pane tab is active.
 const SETTINGS_PANEL_KEYS = new Set([
-  'users', 'usage', 'agents', 'infrastructure', 'wiggum',
+  'users', 'usage', 'agents', 'infrastructure', 'wiggum', 'restore-queue',
   'user-guide', 'getting-started', 'preferences',
 ]);
 
@@ -278,7 +280,10 @@ function openPanelsForRoute(route: string) {
   // `/agents` is the legacy pre-settings route; deployed widget builds still
   // link to it.
   const key = route === '/agents' ? 'agents' : route.match(/^\/settings\/([^/]+)/)?.[1];
-  if (key && SETTINGS_PANEL_KEYS.has(key)) openSettingsPanel(key);
+  // The plain widget embed (`?embed=true`) has no pane tree — PageView renders
+  // the settings page directly, and a settings: tab would only surface an
+  // empty GlobalTerminalPanel over it.
+  if (key && SETTINGS_PANEL_KEYS.has(key) && !isPlainEmbed) openSettingsPanel(key);
 }
 
 export function navigate(path: string) {
@@ -310,7 +315,18 @@ window.addEventListener('pw-navigate-view', ((e: CustomEvent) => {
 }) as EventListener);
 
 // Embed postMessage bridge
+// Browser-local preferences the host widget mirrors (see overlay-panels.ts
+// 'pw-embed-prefs'). Sent on init and whenever the preference changes so the
+// widget's admin menu tracks the toggle without a reload.
+function postPrefsTo(target: Window, origin: string) {
+  try {
+    target.postMessage({ type: 'pw-embed-prefs', alphaFeatures: alphaFeaturesEnabled.value }, origin);
+  } catch { /* ignore */ }
+}
 if (isEmbedded.value) {
+  effect(() => {
+    if (window.parent !== window) postPrefsTo(window.parent, '*');
+  });
   window.addEventListener('message', (e) => {
     if (e.data?.type === 'pw-embed-init') {
       if (e.data.token) {
@@ -318,6 +334,18 @@ if (isEmbedded.value) {
       }
       if (e.data.appId) {
         selectedAppId.value = e.data.appId;
+      }
+      if (e.source) postPrefsTo(e.source as Window, e.origin || '*');
+      // Hand our token back when the host didn't supply one. LoginPage only
+      // posts pw-embed-auth after an *interactive* login, so a remembered
+      // login left the host widget 401-ing against admin APIs (and showing
+      // "sign in" hints) even though the embed is visibly signed in. Same
+      // trust model as the LoginPage post, but targeted at the init sender.
+      if (!e.data.token) {
+        const token = localStorage.getItem('pw-admin-token');
+        if (token && e.source) {
+          (e.source as Window).postMessage({ type: 'pw-embed-auth', token }, e.origin || '*');
+        }
       }
     } else if (e.data?.type === 'pw-embed-navigate') {
       if (e.data.route) {

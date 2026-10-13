@@ -2,7 +2,7 @@ import { ulid } from 'ulidx';
 import { eq, and, sql } from 'drizzle-orm';
 import { homedir } from 'node:os';
 import { mkdirSync, writeFileSync, existsSync } from 'node:fs';
-import { resolve, dirname, join } from 'node:path';
+import { resolve, dirname, join, basename } from 'node:path';
 import { execSync } from 'node:child_process';
 import type {
   AgentRuntime,
@@ -12,6 +12,8 @@ import type {
   LaunchHarnessSession,
   ImportSessionFiles,
   ImportSessionFilesResult,
+  ImportAttachments,
+  ImportAttachmentsResult,
   ExportSessionFiles,
   ExportSessionFilesResult,
   SyncCodebase,
@@ -30,6 +32,7 @@ import { extractArtifactPaths, exportSessionFiles } from './jsonl-utils.js';
 import { launchSpriteSession } from './sprite-sessions.js';
 import { createWorktreeIsolate, type Isolate } from './isolates.js';
 import { beginUsage } from './metering.js';
+import { ATTACHMENT_DIR, resolveUploadPath, readUploadForTransfer } from './tmp-links.js';
 
 export function hydrateFeedback(row: typeof schema.feedbackItems.$inferSelect, tags: string[], screenshots: (typeof schema.feedbackScreenshots.$inferSelect)[], audioFiles: (typeof schema.feedbackAudio.$inferSelect)[] = []): FeedbackItem {
   let titleHistory: FeedbackItem['titleHistory'] = [];
@@ -53,12 +56,11 @@ export function hydrateFeedback(row: typeof schema.feedbackItems.$inferSelect, t
   };
 }
 
-// Single trailing line appended to dispatched prompts. This replaced the old
-// multi-line "[AGENT NOTE] … [/AGENT NOTE]" preamble (removed 2026-06-11) —
-// the only load-bearing part was the <cos-reply> protocol, which the Inbox
-// thread persistence and the slack-bot extract from session output. Keep it
-// one sentence: it shows up verbatim in the session's first user message.
-export const COS_REPLY_DISPATCH_HINT = `(Implement directly. When done, wrap a 1–4 sentence summary — changed files/commits, what you verified, follow-ups — in <cos-reply>…</cos-reply> tags; only wrapped text reaches the Inbox thread.)`;
+// Shared workflow and reply instructions appended to initial dispatch prompts,
+// including custom templates. Keep the trailing parenthetical format compatible
+// with the admin's stripDispatchBoilerplate helper. The Inbox thread persistence
+// and slack-bot extract the <cos-reply> summary from session output.
+export const COS_REPLY_DISPATCH_HINT = `(Implement directly. If this task generates code or docs changes: before committing and pushing any PR changes (including review follow-ups), inspect the repository instructions and CI configuration, run the required quality checks locally using the same commands and configuration as CI (including mypy/type checks where configured, lint, formatting checks, and relevant tests), and fix failures before pushing. If a required check cannot run locally, report the check and blocker explicitly; do not claim it passed. Commit and open a PR for your work. Keep monitoring submitted PRs for CI results, merge conflicts, reviewer comments and approval change requests. Fix CI failures, resolve conflicts and address requested changes by updating the PR, then recheck CI and reviews after every push. Continue until all required CI checks pass and reviewer approval is obtained; opening a PR or pushing a fix does not complete the task. If progress is blocked by unavailable CI or a pending external review, report the blocker and PR status explicitly rather than claiming completion. When done, wrap a 1–4 sentence summary — changed files/commits, what you verified, follow-ups — in <cos-reply>…</cos-reply> tags; only wrapped text reaches the Inbox thread.)`;
 
 export const DEFAULT_PROMPT_TEMPLATE = `Feedback: {{feedback.url}}
 API access: curl -s -H "Authorization: Bearer $PROPANES_TOKEN" "\${PROPANES_API_URL:-http://localhost:3001}/api/v1/admin/feedback/{{feedback.id}}" (both env vars are preset in this session; all /api/v1/admin/* routes need the bearer token)
@@ -184,6 +186,25 @@ function scheduleAutoContinueForYoloResume(sessionId: string, launcherId: string
   }, AUTO_CONTINUE_INITIAL_DELAY_MS);
 }
 
+/** An attachment as it was baked into the prompt: the filename we can read
+ * back out of UPLOAD_DIR, and the path the prompt currently points at. */
+export interface PromptAttachment {
+  filename: string;
+  localPath: string;
+}
+
+/**
+ * The attachment paths a rendered prompt will refer to. Single source of truth
+ * for both prompt rendering and remote shipping, so the files we copy to a
+ * launcher are exactly the ones the prompt names.
+ */
+export function feedbackAttachments(fb: FeedbackItem): PromptAttachment[] {
+  return (fb.screenshots || []).map((s) => ({
+    filename: s.filename,
+    localPath: resolveUploadPath(s.filename),
+  }));
+}
+
 export function renderPromptTemplate(
   template: string,
   fb: FeedbackItem,
@@ -209,11 +230,13 @@ export function renderPromptTemplate(
     customData = `Custom data: ${JSON.stringify(fb.data, null, 2)}`;
   }
 
-  // Screenshots live on disk under uploads/ and are symlinked from /tmp at
-  // submit time (see routes/feedback.ts::linkToTmp). For local-machine agents
-  // the /tmp/<filename> path is directly readable; for remote launchers the
-  // path won't resolve but the filename is still recognisable.
-  const screenshotPaths = (fb.screenshots || []).map((s) => `/tmp/${s.filename}`);
+  // Screenshots live on disk under uploads/ and are symlinked from /tmp when
+  // they're stored (see tmp-links.ts::linkToTmp). resolveUploadPath re-creates a
+  // link that's missing — rows written before images.ts linked them, or after a
+  // /tmp sweep — and falls back to the absolute uploads path if it can't, so we
+  // never hand an agent a /tmp path that isn't there. For remote launchers
+  // neither path resolves, but the filename is still recognisable.
+  const screenshotPaths = feedbackAttachments(fb).map((a) => a.localPath);
   let screenshotText = '';
   if (screenshotPaths.length) {
     screenshotText = screenshotPaths
@@ -459,6 +482,7 @@ export async function dispatchFeedbackToAgent(params: {
 
     const template = agent.promptTemplate || DEFAULT_PROMPT_TEMPLATE;
     const prompt = renderPromptTemplate(template, hydratedFeedback, app, instructions);
+    const attachments = feedbackAttachments(hydratedFeedback);
 
     const { sessionId } = await dispatchAgentSession({
       feedbackId,
@@ -471,6 +495,7 @@ export async function dispatchFeedbackToAgent(params: {
       launcherId: launcherId || undefined,
       ownerUserId: params.ownerUserId ?? feedback.ownerUserId ?? null,
       orgId: params.orgId ?? feedback.orgId ?? null,
+      attachments,
     });
 
     // Bridge the spawned session into the unified CoS thread/channel model.
@@ -636,6 +661,62 @@ export function cleanupSyncBranch(projectDir: string, sessionId: string): void {
   }
 }
 
+/**
+ * Copy a feedback's attachments onto a remote launcher and rewrite the prompt
+ * so its paths point at the copies. Local dispatch needs none of this — the
+ * /tmp symlinks are already on the same machine — but a remote agent otherwise
+ * receives `/tmp/<ulid>.png` paths for files that only exist on the server.
+ *
+ * Returns the prompt unchanged if there's nothing to ship or the transfer
+ * fails: a prompt with a dead image path is still worth dispatching, and the
+ * agent can say it couldn't read the file.
+ */
+async function shipAttachmentsToLauncher(
+  launcherId: string,
+  sessionId: string,
+  attachments: PromptAttachment[],
+  prompt: string,
+): Promise<string> {
+  if (!attachments.length) return prompt;
+
+  const payloads = await Promise.all(attachments.map((a) => readUploadForTransfer(a.filename)));
+  const shippable = attachments
+    .map((a, i) => ({ attachment: a, payload: payloads[i] }))
+    .filter((e): e is { attachment: PromptAttachment; payload: { filename: string; contentBase64: string } } => !!e.payload);
+  if (!shippable.length) return prompt;
+
+  const msg: ImportAttachments = {
+    type: 'import_attachments',
+    sessionId,
+    destDir: ATTACHMENT_DIR,
+    files: shippable.map((e) => e.payload),
+  };
+
+  const result = (await sendAndWait(
+    launcherId,
+    msg,
+    'import_attachments_result',
+    120_000,
+  )) as ImportAttachmentsResult;
+
+  if (!result.ok) throw new Error(result.error || 'launcher rejected attachments');
+
+  // Repoint each prompt path at its remote twin — usually a no-op, since both
+  // sides use /tmp/<filename>, but it matters when the server fell back to an
+  // absolute uploads path because the local symlink couldn't be made. Match on
+  // basename rather than position: the launcher skips filenames it considers
+  // unsafe, so `written` isn't necessarily index-aligned with what we sent.
+  const localByName = new Map(shippable.map((e) => [e.attachment.filename, e.attachment.localPath]));
+  let rewritten = prompt;
+  for (const remotePath of result.written) {
+    const local = localByName.get(basename(remotePath));
+    if (local && local !== remotePath) rewritten = rewritten.split(local).join(remotePath);
+  }
+
+  console.log(`[dispatch] Shipped ${result.written.length} attachment(s) to launcher ${launcherId} for session ${sessionId}`);
+  return rewritten;
+}
+
 export async function dispatchAgentSession(params: {
   feedbackId: string;
   agentEndpointId: string;
@@ -647,6 +728,8 @@ export async function dispatchAgentSession(params: {
   launcherId?: string | null;
   ownerUserId?: string | null;
   orgId?: string | null;
+  /** Files referenced by the prompt; copied to the launcher on remote dispatch. */
+  attachments?: PromptAttachment[];
 }): Promise<{ sessionId: string }> {
   const sessionId = ulid();
   const now = new Date().toISOString();
@@ -829,11 +912,25 @@ export async function dispatchAgentSession(params: {
         }
       }
 
+      // Attachments live in this server's uploads/ dir; the prompt refers to
+      // them by path, so they have to exist on the launcher before it starts.
+      let prompt = params.prompt;
+      try {
+        prompt = await shipAttachmentsToLauncher(
+          launcher.id,
+          sessionId,
+          params.attachments || [],
+          prompt,
+        );
+      } catch (err: any) {
+        console.warn(`[dispatch] Attachment transfer to launcher ${launcher.id} failed, dispatching anyway: ${err.message}`);
+      }
+
       // Route to remote launcher
       const msg: LaunchSession = {
         type: 'launch_session',
         sessionId,
-        prompt: params.prompt,
+        prompt,
         cwd: params.cwd,
           runtime,
         permissionProfile: params.permissionProfile,
@@ -852,6 +949,10 @@ export async function dispatchAgentSession(params: {
       }
     })().catch((err) => {
       console.error(`[dispatch] Async remote launch failed for ${sessionId}:`, err);
+      db.update(schema.agentSessions)
+        .set({ status: 'failed', completedAt: new Date().toISOString() })
+        .where(eq(schema.agentSessions.id, sessionId))
+        .run();
     });
   } else {
     // Local spawn — fire-and-forget, errors are handled in spawnLocal

@@ -13,6 +13,7 @@ import {
   attachAdmin,
   detachAdmin,
   forwardToService,
+  isLivenessPing,
   broadcastToLauncherSessionAdmins,
   cleanupOrphanedSessions,
 } from './agent-sessions.js';
@@ -41,7 +42,7 @@ import { dispatchPendingFollowups } from './routes/admin/session-followups.js';
 import { startRetentionSweeper } from './routes/admin/cos-retention.js';
 import { ensureCosThreadsForOrphanSessions } from './cos-inbox.js';
 import { detectClaudeAuthRequired } from './claude-auth-detect.js';
-import { mergePrUrls } from './pr-detect.js';
+import { mergePrUrls, mergePrUrlList } from './pr-detect.js';
 import { startSshGateway } from './ssh-gateway.js';
 
 const PORT = parseInt(process.env.PORT || '3001', 10);
@@ -376,7 +377,15 @@ agentWss.on('connection', async (ws, req) => {
   console.log(`Admin attached to agent session: ${sessionId}`);
 
   ws.on('message', (raw) => {
-    forwardToService(ws, raw.toString());
+    const text = raw.toString();
+    // Answer the terminal's liveness probe here; the session-service has no
+    // use for it and the browser only needs to know this socket still carries
+    // traffic. See isLivenessPing.
+    if (isLivenessPing(text)) {
+      if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'pong', sessionId }));
+      return;
+    }
+    forwardToService(ws, text);
   });
 
   ws.on('close', () => {
@@ -513,6 +522,23 @@ launcherWss.on('connection', (ws, req) => {
                 .where(eq(schema.agentSessions.id, msg.sessionId))
                 .run();
             }
+          }
+          break;
+        }
+
+        case 'launcher_session_pr_urls': {
+          const row = db
+            .select({ prUrls: schema.agentSessions.prUrls })
+            .from(schema.agentSessions)
+            .where(eq(schema.agentSessions.id, msg.sessionId))
+            .get();
+          if (!row) break;
+          const merged = mergePrUrlList(row.prUrls, msg.prUrls);
+          if (merged) {
+            db.update(schema.agentSessions)
+              .set({ prUrls: merged })
+              .where(eq(schema.agentSessions.id, msg.sessionId))
+              .run();
           }
           break;
         }

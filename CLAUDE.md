@@ -207,7 +207,7 @@ The dev setup runs **two** node processes: the main server (`src/index.ts`, port
 
 ### Per-user pods: running from NFS
 
-Per-user pods boot from the baked `/app` image build by default, but `docker-launcher-entrypoint.sh` supports running the services from the NFS-mounted source tree instead. Opt in by dropping a marker on the pod's persistent volume:
+Per-user pods (e.g. propanes.example.com/&lt;user&gt;) boot from the baked `/app` image build by default, but `docker-launcher-entrypoint.sh` supports running the services from the NFS-mounted source tree instead. Opt in by dropping a marker on the pod's persistent volume:
 
 ```bash
 echo /mnt/stage-nfs-src/admin/propanes > /data/propanes-run-from-nfs

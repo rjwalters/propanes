@@ -1,7 +1,8 @@
-import { execSync, execFileSync, spawnSync } from 'node:child_process';
+import { execSync, execFile, execFileSync, spawnSync } from 'node:child_process';
 import { writeFileSync, unlinkSync, chmodSync, existsSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
+import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
 import * as pty from 'node-pty';
@@ -16,10 +17,19 @@ export function safeDir(dir: string): string {
 const TMUX_PREFIX = 'pw-';
 const PW_TMUX_CONF = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'tmux-pw.conf');
 
-let tmuxAvailable: boolean | null = null;
+let tmuxAvailable = false;
+let tmuxProbedAt = 0;
+const TMUX_PROBE_RETRY_MS = 5000;
 
 export function isTmuxAvailable(): boolean {
-  if (tmuxAvailable !== null) return tmuxAvailable;
+  // Only a positive result is cached for good. A negative one is re-probed:
+  // `tmux -V` can fail transiently (fork failure under boot load), and caching
+  // that for the lifetime of the process meant no session could ever be
+  // recovered again — every pane opened read-only until the service restarted.
+  if (tmuxAvailable) return true;
+  const now = Date.now();
+  if (tmuxProbedAt && now - tmuxProbedAt < TMUX_PROBE_RETRY_MS) return false;
+  tmuxProbedAt = now;
   try {
     execSync('tmux -V', { stdio: 'pipe' });
     tmuxAvailable = true;
@@ -179,6 +189,30 @@ export function killTmuxSession(sessionId: string): boolean {
   return r.status === 0;
 }
 
+const execFileAsync = promisify(execFile);
+
+/** Repaint the attached client's complete screen without resizing the agent. */
+export async function refreshTmuxClient(ptyProcess: Pick<pty.IPty, 'pid'>): Promise<boolean> {
+  if (ptyProcess.pid <= 0) return false;
+  try {
+    // node-pty exposes the tmux attach process PID, but not its TTY path.
+    // Match that client explicitly so another viewer is never targeted.
+    const { stdout } = await execFileAsync('tmux', [
+      ...TMUX_SOCKET, 'list-clients', '-F', '#{client_pid} #{client_tty}',
+    ], { timeout: 1000 });
+    const prefix = `${ptyProcess.pid} `;
+    const client = stdout.split('\n').find((line) => line.startsWith(prefix))?.slice(prefix.length);
+    if (!client) return false;
+    // Keep the event loop free to drain the PTY while tmux writes the repaint.
+    await execFileAsync('tmux', [
+      ...TMUX_SOCKET, 'refresh-client', '-t', client,
+    ], { timeout: 1000 });
+    return true;
+  } catch {
+    return false; // The client may have exited during attach/recovery.
+  }
+}
+
 export function captureTmuxPane(sessionId: string): string {
   const name = tmuxName(sessionId);
   try {
@@ -245,6 +279,21 @@ export function getTmuxPaneCommand(sessionId: string): string {
     return out;
   } catch {
     return '';
+  }
+}
+
+/** PID of the process running directly in a Propanes tmux pane. Interactive
+ * agent commands are exec'd, so this is also Claude's live registry key. */
+export function getTmuxPanePid(sessionId: string): number | null {
+  const name = tmuxName(sessionId);
+  try {
+    const raw = execFileSync('tmux', [
+      ...TMUX_SOCKET, 'list-panes', '-t', name, '-F', '#{pane_pid}',
+    ], { stdio: 'pipe', encoding: 'utf-8' }).trim().split('\n')[0];
+    const pid = Number(raw);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
   }
 }
 

@@ -1,5 +1,6 @@
 import { SessionViewToggle } from '../terminal/SessionViewToggle.js';
 import { ChiefOfStaffBubble } from '../cos/ChiefOfStaffBubble.js';
+import { alphaFeaturesEnabled } from '../../lib/settings.js';
 import { StructuredView } from '../terminal/StructuredView.js';
 import { SessionSummaryView } from '../sessions/SessionSummaryView.js';
 import { FeedbackCompanionView } from '../feedback/FeedbackCompanionView.js';
@@ -33,6 +34,7 @@ import { UsersPage } from '../../pages/UsersPage.js';
 import { UsagePage } from '../../pages/UsagePage.js';
 import { ChannelPage } from '../../pages/ChannelPage.js';
 import { ApprovalQueuePage } from '../../pages/ApprovalQueuePage.js';
+import { RestoreQueuePage } from '../../pages/RestoreQueuePage.js';
 import { SpecWikiPage } from '../../pages/SpecWikiPage.js';
 import { FlatterPage } from '../../pages/FlatterPage.js';
 import {
@@ -54,14 +56,16 @@ export function renderTabContent(
   // View tabs (sidebar sections rendered as pane content)
   const isView = sid.startsWith('view:');
   if (isView) {
+    const isSidebar = sid === 'view:nav' || sid === 'view:terminals' || sid.startsWith('view:sessions-list') || sid.startsWith('view:files');
     return (
-      <div key={sid} style={{ display: isVisible ? 'flex' : 'none', width: '100%', flex: 1, minHeight: 0, overflow: 'auto' }}>
+      <div key={sid} class={isSidebar ? undefined : 'pane-page-surface'} style={{ display: isVisible ? 'flex' : 'none', width: '100%', flex: 1, minHeight: 0, overflow: 'auto' }}>
         {sid === 'view:page' ? (
           <PageView />
         ) : sid === 'view:feedback' ? (
           (() => {
             const aid = selectedAppId.value || applications.value[0]?.id;
-            if (!aid) return <div style={{ padding: 16, color: 'var(--pw-text-muted)' }}>No apps configured</div>;
+            if (!applications.value.length) return <GettingStartedPage />;
+            if (!aid) return <GettingStartedPage />;
             return <FeedbackListPage appId={aid} />;
           })()
         ) : sid.startsWith('view:feedback:app:') ? (
@@ -131,7 +135,9 @@ export function renderTabContent(
   if (sid.startsWith('cos:')) {
     return (
       <div key={sid} style={{ display: isVisible ? 'flex' : 'none', width: '100%', flex: 1, minHeight: 0 }}>
-        <ChiefOfStaffBubble mode="pane" floatingButton={false} />
+        {alphaFeaturesEnabled.value
+          ? <ChiefOfStaffBubble mode="pane" floatingButton={false} />
+          : <div class="legacy-feature-notice"><h2>Ops chat is an alpha feature</h2><p>Enable “Alpha test new features” in Preferences to use it. Existing threads are preserved while disabled.</p><a href="#/settings/preferences">Open Preferences</a></div>}
       </div>
     );
   }
@@ -140,12 +146,13 @@ export function renderTabContent(
   if (sid.startsWith('settings:')) {
     const key = sid.slice(9);
     return (
-      <div key={sid} style={{ display: isVisible ? 'flex' : 'none', width: '100%', flex: 1, minHeight: 0, overflow: 'auto' }}>
+      <div key={sid} class={key === 'getting-started' ? 'pane-page-surface' : 'pane-page-surface pane-settings-surface'} style={{ display: isVisible ? 'flex' : 'none', width: '100%', flex: 1, minHeight: 0, overflow: 'auto' }}>
         {key === 'users' ? <UsersPage />
           : key === 'usage' ? <UsagePage />
           : key === 'agents' ? <AgentsPage />
           : key === 'infrastructure' ? <InfrastructurePage />
           : key === 'wiggum' ? <WiggumPage />
+          : key === 'restore-queue' ? <RestoreQueuePage />
           : key === 'user-guide' ? <UserGuidePage />
           : key === 'getting-started' ? <GettingStartedPage />
           : key === 'preferences' ? <SettingsPage />

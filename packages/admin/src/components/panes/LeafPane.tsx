@@ -1,5 +1,6 @@
 import { useRef, useCallback, useEffect, useState } from 'preact/hooks';
 import { signal } from '@preact/signals';
+import { isOpenSession } from '../../lib/open-session-counts.js';
 import { type ViewMode } from '../terminal/SessionViewToggle.js';
 import type { LeafNode } from '../../lib/pane-tree.js';
 import { PopupMenu } from '../pickers/PopupMenu.js';
@@ -343,7 +344,9 @@ function PaneHeader({
             </a>
           )}
           <RuntimeBadge runtime={sess?.runtime} permissionProfile={sess?.permissionProfile} />
-          <PrBadges prUrls={sess?.prUrls} />
+          {/* compact: 2 badges + "+N" chip, like the sessions list — a session
+              with a dozen PRs must not crowd the ticket title out of the header. */}
+          <PrBadges prUrls={sess?.prUrls} compact />
         </>
       )}
       <span style="flex:1" />
@@ -398,7 +401,7 @@ function getSingletonMeta(sid: string): SingletonMeta {
       plusKind: 'claude',
       countSuffix: () => {
         const count = allSessions.value.filter((s: any) => (
-          s.status !== 'deleted'
+          isOpenSession(s)
           && s.machineId === machineId
           && (!appId || s.appId === appId)
         )).length;
@@ -419,7 +422,7 @@ function getSingletonMeta(sid: string): SingletonMeta {
         plusKind: 'claude',
         countSuffix: () => {
           const allSess2 = allSessions.value;
-          const agents = allSess2.filter((s: any) => s.permissionProfile !== 'plain' && s.status !== 'deleted');
+          const agents = allSess2.filter((s: any) => s.permissionProfile !== 'plain' && isOpenSession(s));
           return ` (${agents.length})`;
         },
         extraBadges: () => {
@@ -440,7 +443,7 @@ function getSingletonMeta(sid: string): SingletonMeta {
         label: 'Terminals',
         plusKind: 'new',
         countSuffix: () => {
-          const terminals = allSessions.value.filter((s: any) => s.permissionProfile === 'plain' && s.status !== 'deleted');
+          const terminals = allSessions.value.filter((s: any) => s.permissionProfile === 'plain' && isOpenSession(s));
           return ` (${terminals.length})`;
         },
       };
@@ -1483,7 +1486,7 @@ export function LeafPane({ leaf }: LeafPaneProps) {
         );
       })()}
 
-      {activeId && !activeId.startsWith('view:') && !activeId.startsWith('cos:') && (
+      {activeId && !activeId.startsWith('view:') && !activeId.startsWith('cos:') && !activeId.startsWith('settings:') && (
         <PaneHeader
           sessionId={activeId}
           sessionMap={sessionMap}

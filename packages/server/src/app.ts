@@ -4,8 +4,8 @@ import { logger } from 'hono/logger';
 import { serveStatic } from '@hono/node-server/serve-static';
 import { readFile } from 'node:fs/promises';
 import { resolve as resolvePath } from 'node:path';
-import { eq } from 'drizzle-orm';
-import { db, schema } from './db/index.js';
+import { enforceIpAllowlist } from './access-control.js';
+import { resolveAdminApp } from './admin-app.js';
 import { feedbackRoutes } from './routes/feedback.js';
 import { adminRoutes } from './routes/admin/index.js';
 import { imageRoutes } from './routes/images.js';
@@ -30,6 +30,12 @@ import { requireAdminAuth } from './admin-auth.js';
 export const app = new Hono();
 
 app.use('*', logger());
+
+// Network access control. A no-op unless PROPANES_ALLOWED_IPS is set, so
+// existing deployments are unaffected. Deliberately mounted BEFORE auth: a
+// disallowed source should never reach a credential check at all. See
+// access-control.ts for why a prefix-mounted deployment needs this.
+app.use('*', enforceIpAllowlist);
 // Reflect the request Origin header instead of returning "*". A wildcard
 // Access-Control-Allow-Origin is rejected by browsers whenever the request
 // uses credentials-mode "include" (cookies, auth headers on cross-origin
@@ -217,27 +223,42 @@ app.use('/widget/*', serveStatic({ root: '../widget/dist/', rewriteRequestPath: 
 // The admin's index.html embeds the feedback widget with a hardcoded
 // `data-app-key` that must match the admin app's current apiKey in the DB.
 // Hardcoding drifts whenever the DB is reseeded — so we swap a sentinel
-// (`__ADMIN_API_KEY__`) at serve time with the live key. Serves with
-// no-cache to always pick up fresh builds + current key.
+// (`__ADMIN_API_KEY__`) at serve time with the live key (see admin-app.ts
+// for how the admin app is identified). Serves with no-cache to always pick
+// up fresh builds + current key. When no admin app can be identified the
+// sentinel is left in place: the widget then omits X-API-Key rather than
+// filing admin feedback into some other application.
 const ADMIN_DIST = resolvePath(process.cwd(), '../admin/dist');
 const ADMIN_KEY_SENTINEL = '__ADMIN_API_KEY__';
-const SELF_PROJECT_DIR = resolvePath(process.cwd(), '..', '..');
+
+// PROPANES_BASE_PATH — the path prefix this server is reachable at from the
+// browser, when a reverse proxy mounts it below the origin root
+// (e.g. https://host/propanes/). Empty (the default) means served at the root.
+//
+// The proxy is expected to STRIP the prefix before forwarding, so the routes
+// below stay mounted at '/' and nothing here needs to change. What the server
+// cannot otherwise know is what the *browser* sees — and the admin SPA has to
+// know, because every server URL it builds is root-relative and would escape
+// the mount.
+//
+// Previously the SPA guessed, deriving the prefix from the '/admin' segment of
+// its own document path (admin/src/lib/base-path.ts). That works for the
+// /admin/ shell but silently fails for the two other shells this server
+// exposes — the service root ('/') and per-user workspaces ('/<user>') — where
+// there is no '/admin' marker to match, so the prefix resolves to '' and every
+// request escapes the mount. Setting this makes the server authoritative and
+// removes the guess.
+//
+// Normalised to either '' or '/segment' (leading slash, no trailing slash).
+export const BASE_PATH: string = (() => {
+  const raw = (process.env.PROPANES_BASE_PATH ?? '').trim();
+  if (!raw || raw === '/') return '';
+  const withLead = raw.startsWith('/') ? raw : `/${raw}`;
+  return withLead.replace(/\/+$/, '');
+})();
 
 function resolveAdminAppApiKey(): string | null {
-  const byDir = db
-    .select({ apiKey: schema.applications.apiKey })
-    .from(schema.applications)
-    .where(eq(schema.applications.projectDir, SELF_PROJECT_DIR))
-    .get();
-  if (byDir?.apiKey) return byDir.apiKey;
-  const byName = db
-    .select({ apiKey: schema.applications.apiKey })
-    .from(schema.applications)
-    .where(eq(schema.applications.name, 'Propanes Admin'))
-    .get();
-  if (byName?.apiKey) return byName.apiKey;
-  const any = db.select({ apiKey: schema.applications.apiKey }).from(schema.applications).get();
-  return any?.apiKey ?? null;
+  return resolveAdminApp()?.apiKey ?? null;
 }
 
 async function serveAdminIndex(c: any) {
@@ -250,6 +271,34 @@ async function serveAdminIndex(c: any) {
   }
   const key = resolveAdminAppApiKey();
   if (key) html = html.split(ADMIN_KEY_SENTINEL).join(key);
+
+  // Tell the SPA its mount prefix instead of making it infer one. This lands
+  // before any module script, so base-path.ts sees it at import time (it
+  // patches fetch/WebSocket/EventSource on first import).
+  if (BASE_PATH) {
+    html = html.replace(
+      /<head(\s[^>]*)?>/i,
+      (m) => `${m}<script>window.__PROPANES_BASE_PATH__=${JSON.stringify(BASE_PATH)}</script>`
+    );
+  }
+
+  // Asset URLs. The bundle is built with base '/admin/', so the shell's script
+  // and link tags point at absolute /admin/… paths that escape a prefixed
+  // mount — the host app answers them with its own index.html, which surfaces
+  // as the "text/html is not a module script" white-iframe failure.
+  //
+  // Two ways out, and which one is correct depends on where the shell is
+  // being served:
+  //   - At /admin/ itself the assets sit alongside the document, so relative
+  //     URLs reach them under any prefix without the server knowing it.
+  //   - At the root or per-user shells ('/', '/<user>') relative URLs would
+  //     resolve to the wrong directory, so the prefix has to be written in.
+  //     That is only possible now that BASE_PATH is configured.
+  if (/^\/admin\/[^/]*$/.test(c.req.path)) {
+    html = html.replaceAll('"/admin/', '"./');
+  } else if (BASE_PATH) {
+    html = html.replaceAll('"/admin/', `"${BASE_PATH}/admin/`);
+  }
   c.header('Content-Type', 'text/html; charset=utf-8');
   c.header('Cache-Control', 'no-cache, no-store, must-revalidate');
   return c.body(html);

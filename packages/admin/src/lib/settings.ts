@@ -12,6 +12,41 @@ function loadSetting<T>(key: string, fallback: T): T {
 }
 
 export const theme = signal<Theme>(loadSetting('pw-theme', 'system'));
+export const alphaFeaturesEnabled = signal<boolean>(loadSetting<boolean>('pw-alpha-features', false) === true);
+effect(() => { localStorage.setItem('pw-alpha-features', JSON.stringify(alphaFeaturesEnabled.value)); });
+window.addEventListener('storage', event => {
+  if (event.key === 'pw-alpha-features') alphaFeaturesEnabled.value = event.newValue === 'true';
+});
+export type StructuredColor = 'black' | 'charcoal' | 'workspace';
+function normalizeStructuredColor(value: unknown): StructuredColor {
+  return value === 'charcoal' || value === 'workspace' ? value : 'black';
+}
+export const structuredColor = signal<StructuredColor>(normalizeStructuredColor(loadSetting('pw-structured-color', 'black')));
+effect(() => {
+  localStorage.setItem('pw-structured-color', JSON.stringify(structuredColor.value));
+  document.documentElement.dataset.structuredColor = structuredColor.value;
+});
+window.addEventListener('storage', event => {
+  if (event.key !== 'pw-structured-color') return;
+  try { structuredColor.value = normalizeStructuredColor(JSON.parse(event.newValue || 'null')); }
+  catch { structuredColor.value = 'black'; }
+});
+export type TerminalColor = 'dark-grey' | 'black' | 'graphite';
+export function normalizeTerminalColor(value: unknown): TerminalColor {
+  return value === 'black' || value === 'graphite' ? value : 'dark-grey';
+}
+export const terminalColor = signal<TerminalColor>(normalizeTerminalColor(loadSetting('pw-terminal-color', 'dark-grey')));
+effect(() => {
+  const value = terminalColor.value;
+  localStorage.setItem('pw-terminal-color', JSON.stringify(value));
+  document.documentElement.style.setProperty('--pw-terminal-bg', `var(--pw-pty-${value})`);
+});
+// Keep embedded session frames and separate tabs in sync with Preferences.
+window.addEventListener('storage', event => {
+  if (event.key !== 'pw-terminal-color') return;
+  try { terminalColor.value = normalizeTerminalColor(JSON.parse(event.newValue || 'null')); }
+  catch { terminalColor.value = 'dark-grey'; }
+});
 export const shortcutsEnabled = signal<boolean>(loadSetting('pw-shortcuts-enabled', true));
 export const tooltipsEnabled = signal<boolean>(loadSetting('pw-tooltips-enabled', true));
 export const showTabs = signal<boolean>(loadSetting('pw-show-tabs', true));
@@ -67,6 +102,11 @@ export function getEffectiveTheme(): 'light' | 'dark' {
   return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
 }
 
+/** Resolved light/dark, tracking both the preference and the OS setting when
+ *  the preference is `system`. Consumers that paint outside CSS (xterm) subscribe
+ *  to this instead of reading `theme` directly. */
+export const effectiveTheme = signal<'light' | 'dark'>(getEffectiveTheme());
+
 export function applyTheme() {
   const el = document.documentElement;
   if (theme.value === 'system') {
@@ -74,6 +114,7 @@ export function applyTheme() {
   } else {
     el.setAttribute('data-theme', theme.value);
   }
+  effectiveTheme.value = getEffectiveTheme();
 }
 
 export function setTheme(t: Theme) {

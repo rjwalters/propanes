@@ -1,3 +1,4 @@
+import { BRAILLE_SPINNERS, extractOscTitle, classifyOutput, type InputState } from './session-input-state.js';
 import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -5,13 +6,20 @@ import type { Server } from 'node:http';
 import * as pty from 'node-pty';
 import { eq, desc } from 'drizzle-orm';
 import { ulid } from 'ulidx';
-import { db, schema } from './db/index.js';
+import { ViewerSizes } from './viewer-sizes.js';
+import { db, schema, runMigrations } from './db/index.js';
 import type { AgentRuntime, PermissionProfile, SequencedOutput, SessionOutputData } from '@propanes/shared';
 import { STREAM_PROFILE_PTY_COLS } from '@propanes/shared';
 import { MessageBuffer } from './message-buffer.js';
-import { safeDir, isTmuxAvailable, spawnInTmux, reattachTmux, tmuxSessionExists, captureTmuxPane, sendKeysToTmux, listPwTmuxSessions, getTmuxPaneCommand, detachTmuxClients } from './tmux-pty.js';
+import { safeDir, isTmuxAvailable, spawnInTmux, reattachTmux, tmuxSessionExists, captureTmuxPane, sendKeysToTmux, listPwTmuxSessions, getTmuxPaneCommand, detachTmuxClients, getTmuxPanePid, refreshTmuxClient } from './tmux-pty.js';
 import { detectClaudeAuthRequired, detectClaudeTrustPrompt, stripTerminalControl } from './claude-auth-detect.js';
-import { mergePrUrls } from './pr-detect.js';
+import { createRecoveryParking } from './session-recovery.js';
+import { mergePrUrls, mergePrUrlList } from './pr-detect.js';
+import { newTranscriptCursor, scanTranscriptForPrUrls, type TranscriptScanCursor } from './pr-transcript-scan.js';
+import { resolveSessionJsonlPath } from './jsonl-utils.js';
+import { backfillTranscriptPrUrls } from './pr-backfill.js';
+import { homedir } from 'node:os';
+import { sessionAgentEnv } from './session-agent-env.js';
 
 const PORT = parseInt(process.env.SESSION_SERVICE_PORT || '3002', 10);
 
@@ -19,6 +27,17 @@ const PORT = parseInt(process.env.SESSION_SERVICE_PORT || '3002', 10);
 delete process.env.CLAUDECODE;
 const MAX_OUTPUT_LOG = 500 * 1024; // 500KB
 const FLUSH_INTERVAL = 10_000; // 10s
+// Where the agents' `.claude/projects` transcripts live (the launcher-daemon
+// uses the same rule; on the control plane ~/.claude is usually a symlink).
+const AGENT_HOME = process.env.AGENT_HOME || homedir();
+
+// Flipped once the HTTP/WS server is listening. Everything before that point
+// is startup: a throw there means we will never bind :3002, and "continuing"
+// would leave a process that is alive, reports healthy to systemd, and serves
+// nothing — every session pane then attaches, paints history and silently
+// swallows input until someone restarts the service. Crash instead so
+// Restart=always does its job. See docs/session-service-boot-race.md.
+let listening = false;
 
 // Safety net: node-pty's onData fires synchronously during a ReadStream read;
 // any throw from a handler bubbles up as an uncaughtException and kills the
@@ -26,81 +45,34 @@ const FLUSH_INTERVAL = 10_000; // 10s
 // and keep running instead — individual callers still catch their own
 // expected errors, this is the last-resort guard against bugs.
 process.on('uncaughtException', (err) => {
+  if (!listening) {
+    console.error('[session-service] fatal error during startup:', err);
+    process.exit(1);
+  }
   console.error('[session-service] uncaughtException (continuing):', err);
 });
 process.on('unhandledRejection', (reason) => {
+  if (!listening) {
+    console.error('[session-service] fatal rejection during startup:', reason);
+    process.exit(1);
+  }
   console.error('[session-service] unhandledRejection (continuing):', reason);
 });
 
 // ---------- Message buffer ----------
 
+// On a fresh checkout `pnpm dev` boots index.ts and session-service.ts
+// concurrently, and only index.ts used to call runMigrations(). Whichever lost
+// the race, session-service constructed MessageBuffer against a schema-less
+// database and died with `no such table: pending_messages` -- leaving the API
+// up but every terminal dead until someone manually restarted it. The
+// statements are all CREATE TABLE IF NOT EXISTS, so running them from both
+// processes is idempotent (WAL + busy_timeout serializes the concurrent DDL).
+runMigrations();
+
 const messageBuffer = new MessageBuffer();
 
 // ---------- PTY process management ----------
-
-// Claude Code signals state via OSC 0 (Set Window Title):
-//   Spinner chars (⠐⠂⠈⠠ etc.) = actively working → 'active'
-//   ✳ prefix = done working → 'idle' or 'waiting'
-// We parse these from the onData stream for real-time detection.
-// To distinguish idle vs waiting, we check the recent output buffer
-// for permission prompt indicators ("Esc to cancel") at the moment of transition.
-
-const BRAILLE_SPINNERS = new Set('⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⠐⠂⠈⠠⡀⢀⠁⠄⠑⠒');
-
-// Parse OSC 0 title sequences from raw PTY data.
-// Returns the last title found in the chunk, or null.
-function extractOscTitle(data: string): string | null {
-  let lastTitle: string | null = null;
-  let idx = 0;
-  while (idx < data.length) {
-    // Look for ESC ] 0 ;
-    const oscStart = data.indexOf('\x1b]0;', idx);
-    if (oscStart === -1) break;
-    const contentStart = oscStart + 4;
-    // Find BEL terminator
-    const belEnd = data.indexOf('\x07', contentStart);
-    // Find ST terminator (ESC \)
-    const stEnd = data.indexOf('\x1b\\', contentStart);
-    let end = -1;
-    if (belEnd !== -1 && stEnd !== -1) end = Math.min(belEnd, stEnd);
-    else if (belEnd !== -1) end = belEnd;
-    else if (stEnd !== -1) end = stEnd;
-    if (end === -1) break;
-    lastTitle = data.slice(contentStart, end);
-    idx = end + 1;
-  }
-  return lastTitle;
-}
-
-// Classify a title as active, idle, or waiting.
-// When the title indicates idle (✳), check the LAST FEW LINES of visible text
-// for permission prompts or interactive selection prompts.
-// Only checking the tail avoids false positives when an agent's output text
-// *discusses* these patterns (e.g. "arrow keys" appearing in code analysis).
-function classifyFromTitle(title: string, visibleText: string): InputState {
-  const firstChar = title.charAt(0);
-  if (BRAILLE_SPINNERS.has(firstChar)) return 'active';
-  if (firstChar !== '✳') return 'active'; // unknown title = assume active
-
-  // Only check the last ~8 lines where actual prompts appear
-  const lines = visibleText.trimEnd().split('\n');
-  const tail = lines.slice(-8).join('\n');
-
-  if (/Do you want to .+\?/.test(tail)) return 'waiting';
-  if (tail.includes('Would you like to proceed')) return 'waiting';
-  // Claude Code tool permission prompts (Allow/Deny buttons, Yes/No)
-  if (/\bAllow\b.*\bDeny\b/.test(tail)) return 'waiting';
-  if (/\bYes\b.*\bNo\b/.test(tail)) return 'waiting';
-  if (/Esc to cancel/i.test(tail)) return 'waiting';
-  // Interactive selection prompts (fzf, inquirer, Claude Code menus)
-  if (/enter to select/i.test(tail)) return 'waiting';
-  if (/arrow keys/i.test(tail)) return 'waiting';
-  if (/use the arrows/i.test(tail)) return 'waiting';
-  if (/↑.*↓|↓.*↑/.test(tail)) return 'waiting';
-  return 'idle';
-}
-
-type InputState = 'active' | 'idle' | 'waiting';
 
 interface AgentProcess {
   sessionId: string;
@@ -112,16 +84,21 @@ interface AgentProcess {
   totalBytes: number;
   outputSeq: number;
   lastInputAckSeq: number;
+  /**
+   * Highest input seq accepted from each attached viewer. Every browser (and
+   * every reconnect) numbers its own input from its own counter, so dedup has
+   * to be per socket: one shared high-water mark let whichever viewer had sent
+   * more drop the other's keystrokes and resizes as "already seen".
+   */
+  inputSeqBySocket: Map<WebSocket, number>;
   adminSockets: Set<WebSocket>;
   /**
    * Per-connected-client requested PTY size. The tmux/PTY is a single shared
    * resource but multiple browsers/panes attach to it at different viewport
-   * sizes. We size the PTY to the LARGEST requested dimensions (per-axis max)
-   * so no viewer is ever truncated — mirroring tmux `window-size largest`.
-   * Last-writer-wins (the old behaviour) let a short pane shrink the PTY and
-   * leave taller panes painting blank rows below the content.
+   * sizes; the most recent (focused) request wins and other viewers mirror
+   * the resulting grid — see ViewerSizes for why not the largest.
    */
-  clientSizes: Map<WebSocket, { cols: number; rows: number }>;
+  clientSizes: ViewerSizes<WebSocket>;
   status: 'running' | 'completed' | 'failed' | 'killed';
   flushTimer: ReturnType<typeof setInterval>;
   inputState: InputState;
@@ -145,6 +122,11 @@ interface AgentProcess {
   tmuxSessionName: string | null;
   /** JSON array of GitHub PR URLs detected in output (mirrors the pr_urls column) */
   prUrlsJson: string | null;
+  /** Claude/Codex session UUID from the row — locates the transcript for PR detection. */
+  claudeSessionId: string | null;
+  startedAt: string | null;
+  /** How far into the transcript the PR scan has read. */
+  transcriptCursor: TranscriptScanCursor;
 }
 
 const activeSessions = new Map<string, AgentProcess>();
@@ -422,6 +404,17 @@ function syncFeedbackDispatchStatus(sessionId: string, sessionStatus: string): v
 }
 
 function appendSessionAuditMarker(sessionId: string, marker: string): void {
+  try {
+    appendSessionAuditMarkerUnsafe(sessionId, marker);
+  } catch (err) {
+    // Concurrent writers can return SQLITE_BUSY even with busy_timeout (see
+    // message-buffer.ts). An audit line is never worth aborting the caller —
+    // this used to take down startup recovery entirely.
+    console.error(`[session-service] audit marker failed for ${sessionId}:`, err);
+  }
+}
+
+function appendSessionAuditMarkerUnsafe(sessionId: string, marker: string): void {
   const existing = db
     .select({ outputLog: schema.agentSessions.outputLog })
     .from(schema.agentSessions)
@@ -440,12 +433,50 @@ function appendProcAuditMarker(proc: AgentProcess, marker: string): void {
   proc.totalBytes += Buffer.byteLength(line);
 }
 
-// Scan the accumulated output for GitHub PR URLs (flush-time, not per-chunk —
-// a badge can lag up to one FLUSH_INTERVAL). Once a URL lands in prUrlsJson it
-// sticks even after the buffer truncates past it.
-function scanPrUrls(proc: AgentProcess): void {
+// Scan for GitHub PR URLs (flush-time, not per-chunk — a badge can lag up to
+// one FLUSH_INTERVAL). Two sources: the accumulated PTY output, and the
+// agent's transcript on disk, which is where the URL usually is — Claude Code
+// collapses the `gh pr create` / `gh pr view` result on screen, so a session
+// working on a PR often never paints its URL. Once a URL lands in prUrlsJson
+// it sticks even after the buffer truncates past it.
+function scanPrUrls(proc: AgentProcess, final = false): void {
   const updated = mergePrUrls(proc.prUrlsJson, proc.outputBuffer);
   if (updated) proc.prUrlsJson = updated;
+  scanTranscriptPrUrls(proc, final);
+}
+
+function scanTranscriptPrUrls(proc: AgentProcess, final: boolean): void {
+  try {
+    if (!proc.claudeSessionId) {
+      // Terminal sessions have no transcript; agent rows may get the UUID
+      // filled in after spawn, so keep looking until it appears.
+      const row = db
+        .select({ claudeSessionId: schema.agentSessions.claudeSessionId })
+        .from(schema.agentSessions)
+        .where(eq(schema.agentSessions.id, proc.sessionId))
+        .get();
+      proc.claudeSessionId = row?.claudeSessionId || null;
+      if (!proc.claudeSessionId) return;
+    }
+    // The live pid lets the resolver follow `/clear`, which rotates Claude to
+    // a fresh transcript UUID mid-process.
+    const livePid = final ? null : (proc.tmuxSessionName ? getTmuxPanePid(proc.sessionId) : proc.ptyProcess.pid);
+    const path = resolveSessionJsonlPath(
+      proc.cwd,
+      proc.cwd,
+      proc.runtime,
+      proc.claudeSessionId,
+      proc.startedAt,
+      final ? proc.status : 'running',
+      AGENT_HOME,
+      livePid,
+    );
+    const urls = scanTranscriptForPrUrls(path, proc.transcriptCursor, final);
+    const updated = mergePrUrlList(proc.prUrlsJson, urls);
+    if (updated) proc.prUrlsJson = updated;
+  } catch (err) {
+    console.error(`[session-service] transcript PR scan failed for ${proc.sessionId}:`, err);
+  }
 }
 
 function flushOutput(sessionId: string): void {
@@ -506,8 +537,9 @@ function spawnSession(params: {
   resumeSessionId?: string;
   appendSystemPrompt?: string;
   suppressAuthCompanion?: boolean;
+  env?: Record<string, string>;
 }): void {
-  const { sessionId, cwd, runtime = 'claude', permissionProfile, allowedTools, claudeSessionId, resumeSessionId, appendSystemPrompt, suppressAuthCompanion = false } = params;
+  const { sessionId, cwd, runtime = 'claude', permissionProfile, allowedTools, claudeSessionId, resumeSessionId, appendSystemPrompt, suppressAuthCompanion = false, env } = params;
   // NFC-normalize: decomposed unicode (NFD accents from macOS clipboards, etc.)
   // crossing a wrap boundary crashes Claude Code's TUI with "Failed to find
   // wrapped line in text" (anthropic/claude-code#395, #678, #34380).
@@ -541,6 +573,7 @@ function spawnSession(params: {
       cwd,
       cols,
       rows: 40,
+      env,
     });
     ptyProcess = result.ptyProcess;
     tmuxSessionName = result.tmuxSessionName;
@@ -551,7 +584,7 @@ function spawnSession(params: {
       cols,
       rows: 40,
       cwd: safeDir(cwd),
-      env: { ...cleanedEnv, TERM: 'xterm-256color' },
+      env: { ...cleanedEnv, ...env, TERM: 'xterm-256color' },
     });
   }
 
@@ -573,8 +606,9 @@ function spawnSession(params: {
     totalBytes: 0,
     outputSeq: 0,
     lastInputAckSeq: 0,
+    inputSeqBySocket: new Map(),
     adminSockets: new Set(),
-    clientSizes: new Map(),
+    clientSizes: new ViewerSizes(),
     status: 'running',
     flushTimer: setInterval(() => flushOutput(sessionId), FLUSH_INTERVAL),
     inputState: 'active' as InputState,
@@ -587,6 +621,9 @@ function spawnSession(params: {
     suppressAuthCompanion,
     tmuxSessionName,
     prUrlsJson: existingRow?.prUrls || null,
+    claudeSessionId: claudeSessionId || resumeSessionId || null,
+    startedAt: new Date().toISOString(),
+    transcriptCursor: newTranscriptCursor(),
   };
 
   activeSessions.set(sessionId, proc);
@@ -656,19 +693,9 @@ function wireOnData(proc: AgentProcess, ptyProcess: pty.IPty): void {
         const fc = title.charAt(0);
         if (fc === '✳' || BRAILLE_SPINNERS.has(fc)) proc.sawWorkingTitle = true;
       }
-      // Classify when we have a new title OR when stuck in 'idle' (re-check with
-      // updated buffer). This handles the race where the ✳ title arrives in one
-      // chunk (→ idle) but the permission prompt text arrives in a later chunk.
-      // Without re-classifying on subsequent data, the session stays stuck in 'idle'.
-      if (title !== null || (proc.lastTitle && proc.inputState === 'idle')) {
-        const visibleTail = proc.outputBuffer.slice(-4000)
-          .replace(/\x1b\[\??[0-9;]*[a-zA-Z]/g, '')  // CSI sequences (including DECSET ?-prefixed)
-          .replace(/\x1b\][^\x07]*\x07/g, '')         // OSC sequences
-          .replace(/\x1b\([A-Z]/g, '')                 // character set designators
-          .replace(/\x1b[>=][0-9;]*[a-zA-Z]/g, '')    // DEC private sequences (DA2 etc.)
-          .replace(/\x1b[\x20-\x2F]*[\x30-\x7E]/g, ''); // remaining 2-char ESC sequences
-        const newState = classifyFromTitle(proc.lastTitle, visibleTail);
-        applyInputState(proc, newState);
+      // Prompt text can change without a new OSC title, including after waiting.
+      if (proc.lastTitle) {
+        applyInputState(proc, classifyOutput(proc.lastTitle, proc.outputBuffer));
       }
       // Claude Code's first-run "trust this folder" prompt appears before the
       // ✳ idle title, so classifyFromTitle can't catch it. Detect it directly
@@ -775,7 +802,7 @@ function wireOnExit(proc: AgentProcess, ptyProcess: pty.IPty): void {
 
     sendSequenced(proc, { kind: 'exit', exitCode, status: proc.status });
 
-    scanPrUrls(proc);
+    scanPrUrls(proc, true);
     const completedAt = new Date().toISOString();
     db.update(schema.agentSessions)
       .set({
@@ -830,6 +857,7 @@ function killSessionProcess(sessionId: string): boolean {
   clearInterval(proc.flushTimer);
   sendSequenced(proc, { kind: 'exit', exitCode: -1, status: 'killed' });
 
+  scanPrUrls(proc, true);
   const now = new Date().toISOString();
   db.update(schema.agentSessions)
     .set({
@@ -838,6 +866,7 @@ function killSessionProcess(sessionId: string): boolean {
       outputBytes: proc.totalBytes,
       lastOutputSeq: proc.outputSeq,
       completedAt: now,
+      prUrls: proc.prUrlsJson,
     })
     .where(eq(schema.agentSessions.id, sessionId))
     .run();
@@ -854,48 +883,57 @@ function resizeSessionProcess(sessionId: string, cols: number, rows: number, ws?
   const safeRows = Math.max(2, Math.min(Number(rows) || 40, MAX_INTERACTIVE_ROWS));
   const safeCols = Math.max(20, Math.min(Number(cols) || DEFAULT_COLS, MAX_INTERACTIVE_COLS));
 
-  // Record this client's requested size so the shared PTY can be sized to the
-  // largest attached viewer (see clientSizes). A resize with no originating
-  // socket (HTTP /resize, recovery) is applied directly without being recorded.
-  if (ws) proc.clientSizes.set(ws, { cols: safeCols, rows: safeRows });
-
-  applyEffectiveSize(proc, { cols: safeCols, rows: safeRows });
+  // Record this client's requested size so the PTY can fall back to the next
+  // most recent viewer when this one detaches (see clientSizes). A resize with
+  // no originating socket (HTTP /resize, recovery) is applied without being
+  // recorded. Either way the newest request is the one the PTY takes.
+  const size = { cols: safeCols, rows: safeRows };
+  if (ws) proc.clientSizes.set(ws, size);
+  applyPtySize(proc, size);
 }
 
-// Resize the shared PTY to the per-axis maximum of every connected client's
-// requested size, so the tallest/widest viewer always gets a fully-painted TUI
-// and no viewer is truncated. `fallback` is used when no client size is on
-// record (e.g. an HTTP resize before any socket registered, or recovery).
-function applyEffectiveSize(
-  proc: AgentProcess,
-  fallback?: { cols: number; rows: number },
-): void {
+// Re-derive the PTY size from the viewers still attached — used when the
+// viewer whose size the PTY currently has goes away.
+function applyEffectiveSize(proc: AgentProcess): void {
+  proc.clientSizes.prune(proc.adminSockets);
+  const size = proc.clientSizes.latest();
+  if (size) applyPtySize(proc, size);
+}
+
+function applyPtySize(proc: AgentProcess, size: { cols: number; rows: number }): void {
   if (proc.status !== 'running') return;
-
-  // Drop sizes for sockets that are no longer attached so a closed pane can't
-  // keep the PTY pinned to its (possibly larger) dimensions forever.
-  for (const sock of proc.clientSizes.keys()) {
-    if (!proc.adminSockets.has(sock)) proc.clientSizes.delete(sock);
-  }
-
-  let cols = fallback?.cols ?? 0;
-  let rows = fallback?.rows ?? 0;
-  for (const size of proc.clientSizes.values()) {
-    if (size.cols > cols) cols = size.cols;
-    if (size.rows > rows) rows = size.rows;
-  }
-  if (cols <= 0 || rows <= 0) return;
-
   // Stream profiles parse stream-json from PTY output. Narrowing the PTY would
   // cause tmux to hard-wrap each JSON line at the column boundary, breaking
   // JSON.parse in cos-turn-consumer.ts. Pin cols to the wide value regardless
   // of what the frontend xterm requested.
-  const effectiveCols = needsWideStreamPty(proc.runtime, proc.permissionProfile) ? STREAM_PROFILE_COLS : cols;
-  proc.ptyProcess.resize(effectiveCols, rows);
+  const cols = needsWideStreamPty(proc.runtime, proc.permissionProfile) ? STREAM_PROFILE_COLS : size.cols;
+  const rows = size.rows;
+  const changed = proc.ptyProcess.cols !== cols || proc.ptyProcess.rows !== rows;
+  proc.ptyProcess.resize(cols, rows);
+  // Tell every viewer the grid it must emulate. Sent before the PTY's redraw
+  // bytes so a mirroring pane has resized its xterm by the time they arrive.
+  if (changed) broadcastPtySize(proc, cols, rows);
+}
+
+function broadcastPtySize(proc: AgentProcess, cols: number, rows: number): void {
+  const serialized = JSON.stringify({ type: 'pty_size', sessionId: proc.sessionId, cols, rows });
+  for (const ws of proc.adminSockets) {
+    try {
+      ws.send(serialized);
+    } catch {
+      proc.adminSockets.delete(ws);
+    }
+  }
 }
 
 function writeToSession(sessionId: string, data: string): void {
-  const proc = activeSessions.get(sessionId);
+  let proc = activeSessions.get(sessionId);
+  // Keystroke for a session parked in recovery: try to reattach right now so
+  // the operator's first key revives the pane instead of vanishing, rather
+  // than waiting out the parking lot's next scheduled retry.
+  if (!proc && recoveryParking.isParked(sessionId)) {
+    if (recoveryParking.tryNow(sessionId)) proc = activeSessions.get(sessionId);
+  }
   if (proc && proc.status === 'running') {
     proc.ptyProcess.write(data);
     markUserInput(sessionId, proc, data);
@@ -967,8 +1005,9 @@ function tryRecoverSession(session: typeof schema.agentSessions.$inferSelect): b
       totalBytes: captured.length,
       outputSeq: session.lastOutputSeq ?? 0,
       lastInputAckSeq: session.lastInputSeq ?? 0,
+      inputSeqBySocket: new Map(),
       adminSockets: new Set(),
-      clientSizes: new Map(),
+      clientSizes: new ViewerSizes(),
       status: 'running',
       flushTimer: setInterval(() => flushOutput(session.id), FLUSH_INTERVAL),
       inputState: 'active' as InputState,
@@ -983,6 +1022,9 @@ function tryRecoverSession(session: typeof schema.agentSessions.$inferSelect): b
       suppressAuthCompanion: false,
       tmuxSessionName: session.tmuxSessionName || `pw-${session.id}`,
       prUrlsJson: session.prUrls || null,
+      claudeSessionId: session.claudeSessionId || null,
+      startedAt: session.startedAt || null,
+      transcriptCursor: newTranscriptCursor(),
     };
 
     activeSessions.set(session.id, proc);
@@ -994,6 +1036,55 @@ function tryRecoverSession(session: typeof schema.agentSessions.$inferSelect): b
     return false;
   }
 }
+
+function sendLiveHistory(proc: AgentProcess, ws: WebSocket): void {
+  try {
+    ws.send(JSON.stringify({
+      type: 'history',
+      data: stripTerminalFillRuns(proc.outputBuffer),
+      lastInputAckSeq: proc.inputSeqBySocket.get(ws) ?? 0,
+      inputState: proc.inputState,
+      cols: proc.ptyProcess.cols,
+      rows: proc.ptyProcess.rows,
+    }));
+    // The rolling byte buffer contains terminal deltas, not a screen snapshot.
+    // Idle TUI animations can evict every static line, leaving a newly opened
+    // overlay with only dots. Subscribe before requesting a full tmux repaint
+    // so it follows history through the normal sequenced output stream.
+    if (proc.tmuxSessionName && !needsWideStreamPty(proc.runtime, proc.permissionProfile)) {
+      refreshTmuxClient(proc.ptyProcess);
+    }
+  } catch { /* socket went away */ }
+}
+
+// Viewers attached to a session we could not reattach yet. See
+// session-recovery.ts for why they are parked instead of silently accepted.
+const recoveryParking = createRecoveryParking<WebSocket>({
+  attemptRecovery: (sessionId) => {
+    if (activeSessions.has(sessionId)) return true;
+    const session = db
+      .select()
+      .from(schema.agentSessions)
+      .where(eq(schema.agentSessions.id, sessionId))
+      .get();
+    if (!session || session.status !== 'running') return false;
+    if (!tryRecoverSession(session)) return false;
+    console.log(`[session-service] Late recovery succeeded for ${sessionId}`);
+    return true;
+  },
+  onRecovered: (sessionId, sockets) => {
+    const proc = activeSessions.get(sessionId);
+    if (!proc) return;
+    for (const ws of sockets) {
+      proc.adminSockets.add(ws);
+      // The client RIS-replaces the screen when a second history arrives, so
+      // the snapshot it painted while we were recovering is swapped for the
+      // live buffer rather than appended to it — and its input sequence
+      // counter resyncs from lastInputAckSeq.
+      sendLiveHistory(proc, ws);
+    }
+  },
+});
 
 function markSessionStale(sessionId: string): void {
   const now = new Date().toISOString();
@@ -1007,11 +1098,8 @@ function markSessionStale(sessionId: string): void {
 function attachAdminSocket(sessionId: string, ws: WebSocket): boolean {
   const proc = activeSessions.get(sessionId);
   if (proc) {
-    // Send full history + lastInputAckSeq so client can resume its counter.
-    // cols/rows = current PTY size, so the client can skip redundant resize
-    // bounces when its pane already matches (avoids TUI repaint flicker).
-    ws.send(JSON.stringify({ type: 'history', data: stripTerminalFillRuns(proc.outputBuffer), lastInputAckSeq: proc.lastInputAckSeq, inputState: proc.inputState, cols: proc.ptyProcess.cols, rows: proc.ptyProcess.rows }));
     proc.adminSockets.add(ws);
+    sendLiveHistory(proc, ws);
     return true;
   }
 
@@ -1034,8 +1122,8 @@ function attachAdminSocket(sessionId: string, ws: WebSocket): boolean {
       // DB says running but not in activeSessions — try tmux recovery
       if (tryRecoverSession(session)) {
         const recovered = activeSessions.get(sessionId)!;
-        ws.send(JSON.stringify({ type: 'history', data: stripTerminalFillRuns(recovered.outputBuffer), cols: recovered.ptyProcess.cols, rows: recovered.ptyProcess.rows }));
         recovered.adminSockets.add(ws);
+        sendLiveHistory(recovered, ws);
         return true;
       }
       const tmuxAvailable = isTmuxAvailable();
@@ -1046,6 +1134,10 @@ function attachAdminSocket(sessionId: string, ws: WebSocket): boolean {
           `session-service WebSocket attach could not recover running DB row; left running because tmuxAvailable=${tmuxAvailable} tmuxExists=${tmuxExists}`
         );
         ws.send(JSON.stringify({ type: 'history', data: stripTerminalFillRuns(session.outputLog || '') }));
+        // No PTY behind this socket yet — park it and keep retrying the
+        // reattach so the pane becomes typable on its own. Returning here
+        // without parking is what forced the operator to reload the page.
+        recoveryParking.park(sessionId, ws);
         return true;
       }
       // Recovery failed and the backing tmux session is definitively gone.
@@ -1087,9 +1179,9 @@ function detachAdminSocket(sessionId: string, ws: WebSocket): void {
   const proc = activeSessions.get(sessionId);
   if (proc) {
     proc.adminSockets.delete(ws);
-    // Drop this viewer's size and shrink the PTY back to the remaining viewers
-    // so a closed large pane doesn't leave the PTY pinned wider/taller than any
-    // pane still showing the session.
+    proc.inputSeqBySocket.delete(ws);
+    // Drop this viewer's size and hand the PTY to the next most recent viewer
+    // so a closed pane doesn't leave the PTY at a size no one is looking at.
     if (proc.clientSizes.delete(ws) && proc.clientSizes.size > 0) {
       applyEffectiveSize(proc);
     }
@@ -1099,6 +1191,7 @@ function detachAdminSocket(sessionId: string, ws: WebSocket): void {
     pending.delete(ws);
     if (pending.size === 0) pendingConnections.delete(sessionId);
   }
+  recoveryParking.release(sessionId, ws);
 }
 
 // ---------- Session recovery ----------
@@ -1186,8 +1279,15 @@ app.post('/spawn', async (c) => {
     return c.json({ error: 'Prompt required for headless sessions' }, 400);
   }
 
+  let env: Record<string, string> = {};
   try {
-    spawnSession({ sessionId, prompt, cwd, runtime, permissionProfile, allowedTools, claudeSessionId, resumeSessionId, appendSystemPrompt });
+    env = await sessionAgentEnv(sessionId);
+  } catch (err) {
+    console.warn(`[session-service] Could not build agent env for ${sessionId}:`, err);
+  }
+
+  try {
+    spawnSession({ sessionId, prompt, cwd, runtime, permissionProfile, allowedTools, claudeSessionId, resumeSessionId, appendSystemPrompt, env });
     return c.json({ ok: true, sessionId });
   } catch (err) {
     const pending = pendingConnections.get(sessionId);
@@ -1348,11 +1448,18 @@ wsServer.on('connection', (ws, req) => {
 
         // Sequenced protocol messages
         case 'sequenced_input': {
-          const proc = activeSessions.get(sessionId);
+          // The browser speaks the sequenced protocol, so this — not the
+          // legacy 'input' path — is where a keystroke into a pane parked in
+          // recovery lands. Try the reattach before giving up on it.
+          let proc = activeSessions.get(sessionId);
+          if (!proc && recoveryParking.isParked(sessionId)) {
+            if (recoveryParking.tryNow(sessionId)) proc = activeSessions.get(sessionId);
+          }
           if (!proc) break;
-          // Dedup: only process if seq is new
-          if (msg.seq > proc.lastInputAckSeq) {
-            proc.lastInputAckSeq = msg.seq;
+          // Dedup per viewer socket: only process if seq is new for this sender
+          if (msg.seq > (proc.inputSeqBySocket.get(ws) ?? 0)) {
+            proc.inputSeqBySocket.set(ws, msg.seq);
+            if (msg.seq > proc.lastInputAckSeq) proc.lastInputAckSeq = msg.seq;
             const content = msg.content;
             if (content.kind === 'input' && content.data) {
               writeToSession(sessionId, content.data);
@@ -1392,9 +1499,32 @@ wsServer.on('connection', (ws, req) => {
 
 // ---------- Start ----------
 
-recoverSessions();
+// Recovery is best-effort. It used to run unguarded at top level, so a throw
+// (SQLITE_BUSY against the main server at boot) aborted module evaluation
+// before serve() ran — and the uncaughtException guard below kept the process
+// alive, leaving a service that was "active (running)" but never bound :3002.
+// See docs/session-service-boot-race.md.
+try {
+  recoverSessions();
+} catch (err) {
+  console.error('[session-service] recoverSessions failed at startup (continuing):', err);
+}
+
+// Give ended sessions that predate transcript scanning their PR badges. Off
+// the startup path so a slow disk never delays recovery or the listen.
+setTimeout(() => {
+  try {
+    const r = backfillTranscriptPrUrls(AGENT_HOME);
+    if (r.scanned || r.missing || r.scrubbed) {
+      console.log(`[session-service] PR badge backfill: scanned ${r.scanned}, tagged ${r.tagged}, no transcript ${r.missing}, scrubbed ${r.scrubbed}`);
+    }
+  } catch (err) {
+    console.error('[session-service] PR badge backfill failed:', err);
+  }
+}, 5_000).unref();
 
 const server = serve({ fetch: app.fetch, port: PORT }, () => {
+  listening = true;
   console.log(`[session-service] Running on http://localhost:${PORT}`);
 });
 

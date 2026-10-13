@@ -1,4 +1,8 @@
+import { isMissingRouteResponse, jsonlDeltaQuery } from './jsonl-route.js';
 const BASE = '/api/v1';
+
+// Set once the server has shown it has no POST /jsonl route (older image).
+let jsonlPostUnsupported = false;
 
 function getToken(): string | null {
   return localStorage.getItem('pw-admin-token');
@@ -453,8 +457,8 @@ export const api = {
       body: JSON.stringify(data),
     }),
 
-  scaffoldApp: (data: { name: string; parentDir: string; projectName: string }) =>
-    request<{ id: string; apiKey: string; projectDir: string }>('/admin/applications/scaffold', {
+  scaffoldApp: (data: { name: string; parentDir: string; projectName: string; port?: number }) =>
+    request<{ id: string; apiKey: string; projectDir: string; appUrl: string; port: number }>('/admin/applications/scaffold', {
       method: 'POST',
       body: JSON.stringify(data),
     }),
@@ -551,6 +555,14 @@ export const api = {
       { method: 'POST' },
     ),
 
+  // Hand-correct a session's PR badges. `add` accepts a PR URL,
+  // owner/repo#123 or a bare number; `remove` a URL currently shown.
+  updateSessionPrUrls: (id: string, change: { add?: string; remove?: string }) =>
+    request<{ id: string; prUrls: string[]; added: string | null }>(`/admin/agent-sessions/${id}/pr-urls`, {
+      method: 'POST',
+      body: JSON.stringify(change),
+    }),
+
   archiveAgentSession: (id: string) =>
     request<{ id: string; archived: boolean }>(`/admin/agent-sessions/${id}/archive`, {
       method: 'POST',
@@ -570,10 +582,35 @@ export const api = {
     id: string,
     opts: { fileFilter?: string; tail?: number; cursor?: string | null } = {},
   ): Promise<{ cursor: string; reset: boolean; order: string[]; files: Array<{ key: string; lines: string }>; pending?: boolean }> => {
-    const params: string[] = [`cursor=${encodeURIComponent(opts.cursor || 'init')}`];
-    if (opts.fileFilter) params.push(`file=${encodeURIComponent(opts.fileFilter)}`);
-    if (opts.tail && opts.tail > 0) params.push(`tail=${opts.tail}`);
-    const res = await authFetch(`/admin/agent-sessions/${id}/jsonl?${params.join('&')}`);
+    // POST, not GET: the cursor carries a byte offset per physical transcript
+    // file, so a session with hundreds of subagent JSONLs produces a cursor
+    // tens of kilobytes long. In a query string that overruns Node's header
+    // cap and the poll comes back as HTTP 431.
+    //
+    // The admin bundle is published independently of the server image, so it
+    // can run against a server that predates the POST route. That server
+    // answers the POST with a bare router 404 — fall back to the GET form
+    // (same differential protocol, cursor in the query) and stick with it.
+    const cursor = opts.cursor || 'init';
+    let res: Response | null = null;
+    if (!jsonlPostUnsupported) {
+      res = await authFetch(`/admin/agent-sessions/${id}/jsonl`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cursor,
+          ...(opts.fileFilter ? { file: opts.fileFilter } : {}),
+          ...(opts.tail && opts.tail > 0 ? { tail: opts.tail } : {}),
+        }),
+      });
+      if (await isMissingRouteResponse(res)) {
+        jsonlPostUnsupported = true;
+        res = null;
+      }
+    }
+    if (!res) {
+      res = await authFetch(`/admin/agent-sessions/${id}/jsonl?${jsonlDeltaQuery(cursor, opts)}`);
+    }
     if (!res.ok) {
       let detail = `HTTP ${res.status}`;
       try {
@@ -1368,5 +1405,58 @@ export const api = {
     request<{ ok: boolean; approvalId: string }>(
       `/admin/chief-of-staff/approvals/${id}/deny`,
       { method: 'POST', body: JSON.stringify({ reason }) },
+    ),
+
+  // Restart/restore workflow — sessions cleanupOrphanedSessions marked
+  // 'failed' because propanes.service restarted out from under them.
+  getRestoreQueue: () =>
+    request<{
+      items: Array<{
+        id: string;
+        claudeSessionId: string | null;
+        title: string | null;
+        cwd: string | null;
+        permissionProfile: string;
+        runtime: string;
+        ownerUserId: string | null;
+        orgId: string | null;
+        lastActivityAt: string | null;
+        createdAt: string;
+        completedAt: string | null;
+        collapsedRowCount: number;
+      }>;
+      defaultPrompt: string;
+    }>('/admin/agent-sessions/restore-queue'),
+
+  restoreQueueItem: (id: string, prompt?: string) =>
+    request<{ sessionId: string }>(
+      `/admin/agent-sessions/restore-queue/${id}/restore`,
+      { method: 'POST', body: JSON.stringify({ prompt }) },
+    ),
+
+  dismissRestoreQueueItem: (id: string) =>
+    request<{ id: string; dismissed: boolean }>(
+      `/admin/agent-sessions/restore-queue/${id}/dismiss`,
+      { method: 'POST' },
+    ),
+
+  restoreQueueAll: (ids: string[], prompt?: string, intervalMs?: number) =>
+    request<{ runId: string; total: number }>(
+      '/admin/agent-sessions/restore-queue/restore-all',
+      { method: 'POST', body: JSON.stringify({ ids, prompt, intervalMs }) },
+    ),
+
+  getBulkRestoreProgress: (runId: string) =>
+    request<{
+      total: number;
+      attempted: number;
+      succeeded: Array<{ parentId: string; sessionId: string }>;
+      failed: Array<{ parentId: string; error: string }>;
+      done: boolean;
+    }>(`/admin/agent-sessions/restore-queue/bulk/${runId}`),
+
+  getRestoreOutcomes: (sessionIds: string[]) =>
+    request<{ outcomes: Record<string, string> }>(
+      `/admin/agent-sessions/restore-queue/outcomes?ids=${sessionIds.map(encodeURIComponent).join(',')}`,
     ),
 };

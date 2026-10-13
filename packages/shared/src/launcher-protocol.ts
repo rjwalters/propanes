@@ -60,6 +60,18 @@ export interface LauncherSessionEnded {
   outputLog: string;
 }
 
+/**
+ * GitHub PR URLs newly found in the session's transcript on the launcher's
+ * disk. The server can't read that file itself, and the PTY stream alone
+ * misses most of them (collapsed tool results), so the launcher scans and
+ * reports; the server merges into `agent_sessions.pr_urls`.
+ */
+export interface LauncherSessionPrUrls {
+  type: 'launcher_session_pr_urls';
+  sessionId: string;
+  prUrls: string[];
+}
+
 export interface HarnessStatusUpdate {
   type: 'harness_status';
   harnessConfigId: string;
@@ -73,6 +85,15 @@ export interface ImportSessionFilesResult {
   ok: boolean;
   jsonlFilesWritten: number;
   artifactFilesWritten: number;
+  error?: string;
+}
+
+export interface ImportAttachmentsResult {
+  type: 'import_attachments_result';
+  sessionId: string;
+  ok: boolean;
+  /** Absolute paths written on the launcher, in request order. */
+  written: string[];
   error?: string;
 }
 
@@ -179,8 +200,10 @@ export type LauncherToServerMessage =
   | LauncherSessionStarted
   | LauncherSessionOutput
   | LauncherSessionEnded
+  | LauncherSessionPrUrls
   | HarnessStatusUpdate
   | ImportSessionFilesResult
+  | ImportAttachmentsResult
   | ExportSessionFilesResult
   | ReadSessionJsonlResult
   | SyncCodebaseResult
@@ -297,6 +320,17 @@ export interface ImportSessionFiles {
   artifactFiles: Array<{ path: string; content: string }>;
 }
 
+/** Ship feedback attachments (screenshots) to a remote launcher so the
+ * /tmp paths embedded in the dispatched prompt actually resolve there.
+ * Contents are base64 — these are binary images, unlike the utf-8 JSONL and
+ * artifact payloads of ImportSessionFiles. */
+export interface ImportAttachments {
+  type: 'import_attachments';
+  sessionId: string;
+  destDir: string;
+  files: Array<{ filename: string; contentBase64: string }>;
+}
+
 export interface ExportSessionFiles {
   type: 'export_session_files';
   sessionId: string;
@@ -400,6 +434,7 @@ export type ServerToLauncherMessage =
   | StopHarness
   | LaunchHarnessSession
   | ImportSessionFiles
+  | ImportAttachments
   | ExportSessionFiles
   | ReadSessionJsonl
   | SyncCodebase

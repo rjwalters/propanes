@@ -8,10 +8,18 @@
 #
 # The production image also runs the in-pod launcher + headed browser stack so
 # agent dispatch and noVNC survive pod restarts.
+#
+# Node is pinned to 22, not 24, deliberately: this image's AKS deployment can
+# run from an NFS-mounted source override (see docker-launcher-entrypoint.sh's
+# NFS_MARKER path) whose better-sqlite3 native addon is compiled against
+# Node 22's ABI. The CVE fix that matters here is the pnpm 9.15.9 -> 12.11.2
+# bump (it replaces pnpm's own bundled tar/brace-expansion/minimatch/undici/
+# glob/pacote); Node 22 + pnpm 12.11.2 clears the same findings without an
+# ABI mismatch against that NFS tree.
 
 # ---- Stage 1: build the whole workspace -------------------------------------
 FROM node:22-bookworm AS build
-RUN corepack enable && corepack prepare pnpm@9.14.2 --activate
+RUN corepack enable && corepack prepare pnpm@12.11.2 --activate
 WORKDIR /app
 
 # Workspace config first for layer caching
@@ -35,7 +43,7 @@ FROM node:22-bookworm-slim
 # non-ASCII glyph in the agent TUIs as "_", so Claude Code's arrows/ellipses
 # show up as "--" in the browser terminal. C.UTF-8 is built into glibc.
 ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
-RUN corepack enable && corepack prepare pnpm@9.14.2 --activate
+RUN corepack enable && corepack prepare pnpm@12.11.2 --activate
 RUN groupadd --gid 10001 propanes \
  && useradd --uid 10001 --gid 10001 --home-dir /data/agent-home --shell /bin/bash propanes
 WORKDIR /app
@@ -52,6 +60,7 @@ COPY packages/server/package.json packages/server/
 # python3 stays: agent/dev tooling below (and the az CLI installer) needs it.
 # xz-utils: linear-cli's npm install script untars a .tar.xz release (slim has no xz).
 RUN apt-get update \
+ && apt-get upgrade -y \
  && apt-get install -y --no-install-recommends python3 make g++ \
  && pnpm install --frozen-lockfile --prod \
  && apt-get purge -y make g++ \
@@ -65,15 +74,33 @@ RUN apt-get update \
 # browser cache stays readable at /root/.cache; Claude/Codex agents run as the
 # non-root propanes user with their writable home on /data.
 RUN npm i -g \
-      @anthropic-ai/claude-code@2.1.202 \
+      @anthropic-ai/claude-code@2.1.232 \
       @openai/codex@0.142.5 \
       @schpet/linear-cli@2.2.0 \
       @playwright/mcp@latest \
       playwright@latest \
+ # @schpet/linear-cli vendors its own axios/form-data/minimatch/glob (via
+ # rimraf) and pins versions with known CVEs (axios SSRF/prototype-pollution,
+ # form-data CRLF injection, minimatch/brace-expansion ReDoS) regardless of
+ # which linear-cli release is installed — upstream hasn't bumped them.
+ # Force the patched versions into its own nested node_modules so the fix
+ # survives npm's dedup; linear-cli's CLI surface (axios GET/POST calls) is
+ # unaffected by these patch/minor bumps.
+ && ( cd "$(npm root -g)/@schpet/linear-cli" \
+      && npm install --no-save --no-package-lock \
+           axios@^1.20.0 form-data@^4.0.6 minimatch@^10.2.3 ) \
  && npx --yes playwright install --with-deps chromium \
  && ln -s "$(npm root -g)" /root/node_modules \
  && mkdir -p /root/.claude /root/.codex \
  && node -e 'const f="/root/.claude.json";const fs=require("fs");let j={};try{j=JSON.parse(fs.readFileSync(f))}catch(e){};j.mcpServers=Object.assign({},j.mcpServers,{playwright:{type:"http",url:"http://localhost:8931/mcp"}});fs.writeFileSync(f,JSON.stringify(j))'
+
+# In-session `claude update` can't write the root-owned npm-global tree, so
+# swap npm's /usr/local/bin/claude symlink for a shim that prefers a
+# user-owned native install on the persistent /data volume (see the shim).
+COPY docker-claude-shim.sh /usr/local/bin/docker-claude-shim.sh
+RUN rm /usr/local/bin/claude \
+ && cp /usr/local/bin/docker-claude-shim.sh /usr/local/bin/claude \
+ && chmod +x /usr/local/bin/claude /usr/local/bin/docker-claude-shim.sh
 
 # Dev/agent tooling for in-container terminal sessions: enough to fetch and
 # run installers for the rest (az via aka.ms/InstallAzureCLIDeb, aws via the
@@ -82,6 +109,7 @@ RUN npm i -g \
 # don't survive a pod restart, but the fetch tools to reinstall them always
 # will.
 RUN apt-get update \
+ && apt-get upgrade -y \
  && apt-get install -y --no-install-recommends \
       curl wget git ca-certificates gnupg jq unzip zip less procps \
       openssh-client python3-venv python3-pip \

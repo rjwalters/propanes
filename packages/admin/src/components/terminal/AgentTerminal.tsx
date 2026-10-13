@@ -1,15 +1,42 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
+import { effect } from '@preact/signals';
+import { terminalColor, effectiveTheme } from '../../lib/settings.js';
+import { serverPath } from '../../lib/base-path.js';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { lastTerminalInput } from '../../lib/sessions.js';
 import { copyText } from '../../lib/clipboard.js';
 import { openUrlCompanion } from '../../lib/companion-state.js';
 import { recordPerfEntry } from '../../lib/perf.js';
+import { onWake } from '../../lib/wake.js';
 import { useSessionFileDrop, SessionDropOverlay } from './SessionFileDrop.js';
 import type { InputState } from '../../lib/sessions.js';
 
 const MAX_RECONNECT_ATTEMPTS = 10;
 const RECONNECT_BACKOFF_CAP_MS = 30_000;
+
+// Liveness probe. A socket that died while the machine slept still reports
+// readyState OPEN (see lib/wake.ts), so silence alone proves nothing — we ask.
+// After PING_IDLE_MS without a byte from the server we send a ping; if nothing
+// comes back within PONG_TIMEOUT_MS the socket is dead and we reconnect.
+const PING_IDLE_MS = 25_000;
+const PONG_TIMEOUT_MS = 8_000;
+// How often a pane that has exhausted its reconnects tries again on its own.
+// Slow enough not to hammer a server that is genuinely down, often enough that
+// an unattended pane is live again shortly after the server is.
+const PARKED_RETRY_MS = 60_000;
+
+// Does this server answer liveness pings? A server that predates the pong
+// handler forwards the ping to the session-service, which ignores unknown
+// message types — so silence there means "old server", not "dead socket", and
+// treating it as a dead socket would reconnect every pane every half minute.
+// The admin bundle is served statically and updates the moment it is built,
+// while the server only picks up the handler on restart, so that window is
+// real. Learn the answer once per page load: the first unanswered probe still
+// reconnects (a dead socket is the likelier reading, and reconnecting is the
+// safe move either way) but stops us probing again. Reconnects driven by a
+// socket that actually closed are never gated on this.
+let serverAnswersPing: boolean | null = null;
 
 // Stagger terminal mounts to avoid overwhelming the browser on page load.
 // At most MOUNT_CONCURRENCY xterm instances initialize simultaneously; the
@@ -71,6 +98,46 @@ function truncateHistory(data: string): string {
 
 const MAX_TERMINAL_WRITE_BATCH_BYTES = 32_000;
 const SLOW_TERMINAL_WRITE_MS = 80;
+
+// ANSI palettes for the xterm renderer. The dark set mirrors the workspace's
+// yellow-accent branding (green/cyan map to yellow); the light set keeps the
+// same hue mapping at darker weights so colored output stays legible on a
+// light PTY background. background/foreground/black/cursor/selection are
+// filled in from CSS tokens at runtime.
+const DARK_ANSI_PALETTE = {
+  red: '#f87171',
+  green: '#facc15',
+  yellow: '#fbbf24',
+  blue: '#60a5fa',
+  magenta: '#fb923c',
+  cyan: '#facc15',
+  white: '#e2e8f0',
+  brightBlack: '#64748b',
+  brightRed: '#fca5a5',
+  brightGreen: '#fde047',
+  brightYellow: '#fde68a',
+  brightBlue: '#93c5fd',
+  brightMagenta: '#bae6fd',
+  brightCyan: '#38bdf8',
+  brightWhite: '#f8fafc',
+} as const;
+const LIGHT_ANSI_PALETTE = {
+  red: '#b91c1c',
+  green: '#a16207',
+  yellow: '#b45309',
+  blue: '#1d4ed8',
+  magenta: '#c2410c',
+  cyan: '#a16207',
+  white: '#171717',
+  brightBlack: '#737373',
+  brightRed: '#dc2626',
+  brightGreen: '#ca8a04',
+  brightYellow: '#d97706',
+  brightBlue: '#2563eb',
+  brightMagenta: '#0369a1',
+  brightCyan: '#0284c7',
+  brightWhite: '#000000',
+} as const;
 
 // Global resize ownership: only one terminal instance per session sends resize
 // commands to the server. When two AgentTerminals show the same session (e.g.
@@ -134,36 +201,44 @@ export function AgentTerminal({ sessionId, isActive, onExit, onInputStateChange,
     const ownerToken = Symbol();
     resizeOwners.set(sessionId, ownerToken);
     const isResizeOwner = () => resizeOwners.get(sessionId) === ownerToken;
-    const claimResizeOwnership = () => { resizeOwners.set(sessionId, ownerToken); };
+    const claimResizeOwnership = () => {
+      if (!isResizeOwner()) lastSentSize = null;
+      resizeOwners.set(sessionId, ownerToken);
+    };
 
     const term = new Terminal({
-      cursorBlink: true,
+      cursorBlink: false,
       rightClickSelectsWord: false,
       scrollback: 5000,
       fontSize: 13,
       fontFamily: "'SF Mono', Monaco, 'Cascadia Code', monospace",
       theme: {
-        background: '#1e293b',
+        background: getComputedStyle(document.documentElement).getPropertyValue('--pw-terminal-bg').trim(),
         foreground: '#e2e8f0',
         cursor: '#93c5fd',
         selectionBackground: '#334155',
         black: '#1e293b',
-        red: '#f87171',
-        green: '#facc15',
-        yellow: '#fbbf24',
-        blue: '#60a5fa',
-        magenta: '#fb923c',
-        cyan: '#facc15',
-        white: '#e2e8f0',
-        brightBlack: '#64748b',
-        brightRed: '#fca5a5',
-        brightGreen: '#fde047',
-        brightYellow: '#fde68a',
-        brightBlue: '#93c5fd',
-        brightMagenta: '#bae6fd',
-        brightCyan: '#38bdf8',
-        brightWhite: '#f8fafc',
+        ...DARK_ANSI_PALETTE,
       },
+    });
+
+    // Repaint the existing PTY; do not reconnect or discard its scrollback.
+    // Re-runs when the shade preset or the resolved light/dark theme changes
+    // (the --pw-pty-* tokens carry light values under a light workspace).
+    const stopTerminalTheme = effect(() => {
+      const preset = terminalColor.value;
+      const palette = effectiveTheme.value === 'light' ? LIGHT_ANSI_PALETTE : DARK_ANSI_PALETTE;
+      const style = getComputedStyle(document.documentElement);
+      const background = style.getPropertyValue(`--pw-pty-${preset}`).trim();
+      term.options.theme = {
+        ...term.options.theme,
+        ...palette,
+        background,
+        foreground: style.getPropertyValue('--pw-terminal-foreground').trim(),
+        cursor: style.getPropertyValue('--pw-terminal-foreground').trim(),
+        black: background,
+        selectionBackground: style.getPropertyValue('--pw-terminal-hover').trim(),
+      };
     });
 
     const fit = new FitAddon();
@@ -201,6 +276,14 @@ export function AgentTerminal({ sessionId, isActive, onExit, onInputStateChange,
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let reconnectDelay = 200;
     let reconnectAttempts = 0;
+    // Liveness bookkeeping (see checkLiveness / reconnectNow).
+    let lastServerMessageAt = Date.now();
+    let pongTimer: ReturnType<typeof setTimeout> | null = null;
+    let livenessTimer: ReturnType<typeof setInterval> | null = null;
+    // Set while reconnects are exhausted and we are parked waiting to retry.
+    let retryOnKeyHandler: { dispose: () => void } | null = null;
+    let parkedSince = 0;
+    let parkNoticeShown = false;
     let gotFirstOutput = false;
     let waitingDots: ReturnType<typeof setInterval> | null = null;
     let outputQueue = '';
@@ -277,6 +360,17 @@ export function AgentTerminal({ sessionId, isActive, onExit, onInputStateChange,
     let historyTruncated = false;
     let lastSentSize: { cols: number; rows: number } | null = null;
     let sawHistoryData = false;
+    // Size negotiation (see syncToPtySize). pendingSent is the last size sent
+    // on this socket that the server has not echoed back as pty_size yet.
+    // ptySizeSeen: a pty_size arrived on this socket, so the cols/rows in a
+    // later history message are older than it and must not overwrite it.
+    // ptySizeSupported: this server speaks pty_size at all — an older server
+    // never confirms a resize, and must not be waited on.
+    let pendingSent: { cols: number; rows: number; at: number } | null = null;
+    let ptySizeSeen = false;
+    let ptySizeSupported = false;
+    let mirrorActive = false;
+    let graceTimer: ReturnType<typeof setTimeout> | null = null;
 
     function sendRawInput(data: string) {
       const ws = wsRef.current;
@@ -290,6 +384,12 @@ export function AgentTerminal({ sessionId, isActive, onExit, onInputStateChange,
           timestamp: new Date().toISOString(),
         });
         ws.send(msg);
+      } else {
+        // The keystroke is dropped (deliberately — see ws.onopen), but a
+        // socket we can't send on is one we should be replacing: kick the
+        // reconnect now so the operator's next keystroke has somewhere to go
+        // instead of waiting out a backoff they can't see.
+        checkLiveness();
       }
     }
 
@@ -449,7 +549,7 @@ export function AgentTerminal({ sessionId, isActive, onExit, onInputStateChange,
       const pathWord = w || '';
       if (/^(\/|~\/)/.test(pathWord) && pathWord.length > 1) {
         const filePath = pathWord.startsWith('~/') ? `/home/${pathWord.slice(2)}` : pathWord;
-        const fileUrl = `/files${filePath}`;
+        const fileUrl = serverPath(`/files${filePath}`);
         const pLabel = pathWord.length > 35 ? pathWord.slice(0, 35) + '\u2026' : pathWord;
         items.push({ label: `Open "${pLabel}" in pane`, action: () => {
           openUrlCompanion(`${location.protocol}//${location.host}${fileUrl}`);
@@ -567,6 +667,9 @@ export function AgentTerminal({ sessionId, isActive, onExit, onInputStateChange,
 
       // New socket = the server has no size on record for it yet.
       lastSentSize = null;
+      pendingSent = null;
+      ptySizeSeen = false;
+      lastServerMessageAt = Date.now();
 
       const token = localStorage.getItem('pw-admin-token');
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -577,6 +680,8 @@ export function AgentTerminal({ sessionId, isActive, onExit, onInputStateChange,
       ws.onopen = () => {
         reconnectDelay = 200;
         reconnectAttempts = 0;
+        parkedSince = 0;
+        parkNoticeShown = false;
         sendReplayRequest();
         // Deliberately no input replay here. Keystrokes are only ever sent on
         // an OPEN socket, so anything un-acked at reconnect time is in the
@@ -596,6 +701,9 @@ export function AgentTerminal({ sessionId, isActive, onExit, onInputStateChange,
       };
 
       ws.onmessage = (event) => {
+        // Any byte from the server is proof of life, whatever it says.
+        lastServerMessageAt = Date.now();
+        if (pongTimer) { clearTimeout(pongTimer); pongTimer = null; }
         try {
           const msg = JSON.parse(event.data);
           switch (msg.type) {
@@ -629,6 +737,25 @@ export function AgentTerminal({ sessionId, isActive, onExit, onInputStateChange,
               // Input is fire-and-forget (no replay buffer) — nothing to prune.
               break;
 
+            case 'pong':
+              // Liveness answer; the clearTimeout above was the whole point.
+              serverAnswersPing = true;
+              break;
+
+            case 'pty_size':
+              // Another viewer (or our own request) resized the shared PTY.
+              // This is the server's truth about the grid: render to it. It
+              // must never trigger a resize of our own — two panes that both
+              // believe they are driving would otherwise re-assert their own
+              // size on every echo and fight forever (see syncToPtySize).
+              if (typeof msg.cols === 'number' && typeof msg.rows === 'number' && msg.cols > 0 && msg.rows > 0) {
+                serverPtySize = { cols: msg.cols, rows: msg.rows };
+                ptySizeSeen = true;
+                ptySizeSupported = true;
+                syncToPtySize();
+              }
+              break;
+
             // Legacy messages
             case 'history':
               // Resume input seq from server's last acknowledged seq
@@ -638,7 +765,11 @@ export function AgentTerminal({ sessionId, isActive, onExit, onInputStateChange,
               if (msg.inputState) {
                 onInputStateChange?.(msg.inputState);
               }
-              if (typeof msg.cols === 'number' && typeof msg.rows === 'number' && msg.cols > 0 && msg.rows > 0) {
+              // History is captured when the socket opens, before the server
+              // processes the resize we sent at onopen — so once a pty_size
+              // has arrived on this socket, the history size is the older of
+              // the two and is ignored.
+              if (!ptySizeSeen && typeof msg.cols === 'number' && typeof msg.rows === 'number' && msg.cols > 0 && msg.rows > 0) {
                 serverPtySize = { cols: msg.cols, rows: msg.rows };
               }
               if (msg.data) {
@@ -726,14 +857,7 @@ export function AgentTerminal({ sessionId, isActive, onExit, onInputStateChange,
         if (event.code === 4010) {
           reconnectAttempts++;
           if (reconnectAttempts > 3) {
-            writeTerminal('\r\n\x1b[90m--- Session service unavailable. Click terminal or press any key to retry. ---\x1b[0m\r\n');
-            const retryHandler = term.onData(() => {
-              retryHandler.dispose();
-              reconnectAttempts = 0;
-              reconnectDelay = 200;
-              writeTerminal('\x1b[90mReconnecting...\x1b[0m\r\n');
-              connect();
-            });
+            parkUntilRetry('\r\n\x1b[90m--- Session service unavailable. Click terminal or press any key to retry. ---\x1b[0m\r\n');
             return;
           }
           reconnectTimer = setTimeout(() => connect(), 5000);
@@ -742,14 +866,7 @@ export function AgentTerminal({ sessionId, isActive, onExit, onInputStateChange,
 
         reconnectAttempts++;
         if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-          writeTerminal('\r\n\x1b[31m--- Connection lost. Click terminal or press any key to retry. ---\x1b[0m\r\n');
-          const retryHandler = term.onData(() => {
-            retryHandler.dispose();
-            reconnectAttempts = 0;
-            reconnectDelay = 200;
-            writeTerminal('\x1b[90mReconnecting...\x1b[0m\r\n');
-            connect();
-          });
+          parkUntilRetry('\r\n\x1b[31m--- Connection lost. Click terminal or press any key to retry. ---\x1b[0m\r\n');
           return;
         }
 
@@ -761,7 +878,104 @@ export function AgentTerminal({ sessionId, isActive, onExit, onInputStateChange,
       };
     }
 
+    // Reconnects exhausted: park until something kicks us — a keystroke, or a
+    // wake event via checkLiveness. Before this the keystroke was the ONLY way
+    // back, and it is consumed by the retry (no echo, nothing sent), which is
+    // exactly what a machine coming back from sleep looks like to the operator:
+    // "typing does nothing until I refresh".
+    function parkUntilRetry(message: string) {
+      parkedSince = Date.now();
+      // Say it once. Re-parking after each slow retry would otherwise stamp the
+      // same notice into the pane every minute for as long as the server is down.
+      if (!parkNoticeShown) {
+        writeTerminal(message);
+        parkNoticeShown = true;
+      }
+      if (retryOnKeyHandler) return;
+      const handler = term.onData(() => {
+        if (retryOnKeyHandler !== handler) return;
+        retryOnKeyHandler = null;
+        handler.dispose();
+        writeTerminal('\x1b[90mReconnecting...\x1b[0m\r\n');
+        reconnectNow();
+      });
+      retryOnKeyHandler = handler;
+    }
+
+    // Force a fresh socket now, discarding any pending backoff. Callers that
+    // are retrying a parked pane pass resetAttempts=false so a failure re-parks
+    // after ONE attempt instead of burning the whole backoff ladder again.
+    function reconnectNow(resetAttempts = true) {
+      if (cleanedUp.current || hasExited.current) return;
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      if (pongTimer) { clearTimeout(pongTimer); pongTimer = null; }
+      if (retryOnKeyHandler) { retryOnKeyHandler.dispose(); retryOnKeyHandler = null; }
+      if (resetAttempts) {
+        reconnectAttempts = 0;
+        reconnectDelay = 200;
+      }
+      const stale = wsRef.current;
+      if (stale) {
+        // Drop the handlers before closing: the close we are about to force
+        // must not schedule a second reconnect racing this one.
+        stale.onopen = null;
+        stale.onmessage = null;
+        stale.onclose = null;
+        stale.onerror = null;
+        wsRef.current = null;
+        try { stale.close(); } catch { /* already closing */ }
+      }
+      connect();
+    }
+
+    // Is this socket actually carrying traffic? A machine that slept, or a
+    // network that changed underneath us, leaves a socket that still reads
+    // OPEN and delivers nothing — the browser won't notice until TCP gives up
+    // minutes later. Make it prove itself instead of trusting keystrokes to it.
+    function checkLiveness(force = false) {
+      if (cleanedUp.current || hasExited.current) return;
+      const ws = wsRef.current;
+      if (!ws || ws.readyState === WebSocket.CLOSING || ws.readyState === WebSocket.CLOSED) {
+        if (retryOnKeyHandler) {
+          // Parked after exhausting reconnects. A wake event retries at once;
+          // otherwise keep it to one quiet attempt a minute.
+          if (!force && Date.now() - parkedSince < PARKED_RETRY_MS) return;
+          reconnectNow(false);
+          return;
+        }
+        // Disconnected, with a backoff timer possibly half a minute out.
+        // Retry right now.
+        reconnectNow();
+        return;
+      }
+      if (ws.readyState === WebSocket.CONNECTING) return; // still in flight
+      if (pongTimer) return; // probe already outstanding
+      if (serverAnswersPing === false) return; // nothing would answer
+      try {
+        ws.send(JSON.stringify({ type: 'ping', sessionId, ts: Date.now() }));
+      } catch {
+        reconnectNow();
+        return;
+      }
+      pongTimer = setTimeout(() => {
+        pongTimer = null;
+        // Unanswered. If we have never seen a pong we cannot tell a dead
+        // socket from a server that doesn't speak this, so reconnect once and
+        // then stop probing until the page is reloaded against a newer server.
+        if (serverAnswersPing === null) serverAnswersPing = false;
+        reconnectNow();
+      }, PONG_TIMEOUT_MS);
+    }
+
     connect();
+
+    // Probe after any stretch of silence, and whenever the machine or tab
+    // comes back — the two ways an apparently-OPEN socket turns out to be dead.
+    livenessTimer = setInterval(() => {
+      if (Date.now() - lastServerMessageAt < PING_IDLE_MS) return;
+      checkLiveness();
+    }, PING_IDLE_MS);
+    const offWake = onWake(() => checkLiveness(true));
 
     // Terminal auto-response sequences (DA1, DA2, DSR cursor position report).
     // xterm.js generates these in response to queries from the shell. On reconnect
@@ -781,17 +995,99 @@ export function AgentTerminal({ sessionId, isActive, onExit, onInputStateChange,
       const filtered = data.replace(TERMINAL_RESPONSE_RE, '');
       if (!filtered) return;
       lastTerminalInput.value = Date.now();
+      // Typing into a pane that is mirroring another viewer's grid makes this
+      // pane the one being used: take the PTY size back.
+      if (mirrorActive && isDrivingPtySize()) safeFitAndResize();
       inputBuffer += filtered;
       flushInputBuffer();
     });
 
+    // Only the resize owner in the focused, visible document drives the PTY
+    // size. Another terminal instance for the same session may exist (e.g.
+    // autojump), and a background tab/iframe can have its own owner for the
+    // same PTY; letting it resize the remote session fights the focused view
+    // and makes CLI redraws/cursors jump.
+    function isDrivingPtySize() {
+      return isResizeOwner() && !document.hidden && document.hasFocus();
+    }
+
+    // A viewer that is not driving the size must still emulate the PTY's own
+    // grid. Letting fit() pick a smaller grid than the PTY makes xterm clamp
+    // every cursor move to its bottom row, so the TUI paints as garbage with a
+    // cursor that jumps on each redraw. Instead adopt the PTY grid and scale
+    // the whole terminal down to fit the pane; clicking into it makes this
+    // viewer the driver and returns it to 1:1.
+    function mirrorPtyGrid(): boolean {
+      const el = containerRef.current;
+      if (!el || !serverPtySize) return false;
+      const { cols, rows } = serverPtySize;
+      mirrorActive = true;
+      if (term.cols !== cols || term.rows !== rows) term.resize(cols, rows);
+      const screen = term.element?.querySelector<HTMLElement>('.xterm-screen');
+      if (!term.element || !screen || !screen.offsetWidth || !screen.offsetHeight) return true;
+      const scale = Math.min(1, el.clientWidth / screen.offsetWidth, el.clientHeight / screen.offsetHeight);
+      term.element.style.width = `${screen.offsetWidth}px`;
+      term.element.style.transformOrigin = 'top left';
+      term.element.style.transform = scale < 1 ? `scale(${scale})` : '';
+      return true;
+    }
+
+    function clearMirrorScale() {
+      mirrorActive = false;
+      if (!term.element) return;
+      term.element.style.width = '';
+      term.element.style.transform = '';
+    }
+
+    // Apply the server's truth about the PTY grid (serverPtySize) to this
+    // pane. Sending a size is local intent (safeFitAndResize: a tab switch,
+    // click, focus, pane resize); what the PTY actually has is decided by the
+    // server — the most recent request among all viewers — and echoed back as
+    // pty_size. If the echo matches what we last sent, the PTY is ours: paint
+    // 1:1. If it differs, another viewer's request won (or ours was clamped):
+    // adopt the PTY's grid, scaled to fit, instead of rendering a grid the
+    // PTY does not have — which paints the TUI as garbage. We only give a
+    // just-sent size a short grace period to be echoed before mirroring, so
+    // the bounce's rows-1 and a slow remote hop don't flash the old grid.
+    const PTY_SIZE_GRACE_MS = 1200;
+    function clearGrace() {
+      if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; }
+    }
+    function armGrace(delay: number) {
+      if (graceTimer) return;
+      graceTimer = setTimeout(() => { graceTimer = null; syncToPtySize(); }, Math.max(0, delay));
+    }
+    function syncToPtySize() {
+      if (!serverPtySize) return;
+      const el = containerRef.current;
+      if (!el || el.offsetWidth === 0 || el.offsetHeight === 0) return;
+      const { cols, rows } = serverPtySize;
+      if (pendingSent && pendingSent.cols === cols && pendingSent.rows === rows) {
+        // The server adopted our size.
+        pendingSent = null;
+        clearGrace();
+        clearMirrorScale();
+        if (term.cols !== cols || term.rows !== rows) fit.fit();
+        return;
+      }
+      if (pendingSent) {
+        const elapsed = performance.now() - pendingSent.at;
+        if (elapsed < PTY_SIZE_GRACE_MS) { armGrace(PTY_SIZE_GRACE_MS - elapsed); return; }
+        pendingSent = null;
+      }
+      clearGrace();
+      mirrorPtyGrid();
+    }
+
     function safeFitAndResize(bounce = false) {
       const el = containerRef.current;
       if (!el || el.offsetWidth === 0 || el.offsetHeight === 0) return;
+      if (!isDrivingPtySize()) {
+        if (!mirrorPtyGrid()) fit.fit();
+        return;
+      }
+      clearMirrorScale();
       fit.fit();
-      // Only the resize owner sends resize commands to the server.
-      // Another terminal instance for the same session may exist (e.g. autojump).
-      if (!isResizeOwner()) return;
       const ws = wsRef.current;
       if (ws && ws.readyState === WebSocket.OPEN && term.cols > 0 && term.rows > 0) {
         if (term.cols > 300 || term.rows > 120) return;
@@ -810,7 +1106,11 @@ export function AgentTerminal({ sessionId, isActive, onExit, onInputStateChange,
         const doBounce = bounce && sizeUnchanged && historyTruncated;
         if (doBounce) historyTruncated = false; // one forced repaint is enough
         // Size already registered on this socket and no repaint needed — no-op.
-        if (!doBounce && sentMatches) return;
+        // Unless the PTY has since been resized under us by another viewer
+        // (pty_size said so): then what we last sent is stale and must go
+        // again, or this pane keeps emulating a grid the PTY no longer has.
+        const ptyDrifted = serverPtySize !== null && !serverMatches;
+        if (!doBounce && sentMatches && !ptyDrifted) return;
         if (doBounce && term.rows > 1) {
           inputSeq++;
           const bounceMsg = JSON.stringify({
@@ -832,6 +1132,14 @@ export function AgentTerminal({ sessionId, isActive, onExit, onInputStateChange,
         });
         ws.send(msg);
         lastSentSize = { cols, rows };
+        pendingSent = { cols, rows, at: performance.now() };
+        // A server that echoes pty_size will confirm (or overrule) this; if
+        // nothing comes back in time, fall back to the grid it last reported.
+        // An older server never echoes — don't wait on it.
+        if (ptySizeSupported && serverPtySize && (serverPtySize.cols !== cols || serverPtySize.rows !== rows)) {
+          clearGrace();
+          armGrace(PTY_SIZE_GRACE_MS);
+        }
       }
     }
 
@@ -898,12 +1206,20 @@ export function AgentTerminal({ sessionId, isActive, onExit, onInputStateChange,
     }
     document.addEventListener('visibilitychange', onVisibilityChange);
 
-    // Bounce resize when browser window regains focus
+    // Another document may resize this PTY while we're unfocused. Re-register
+    // our size once on return; subsequent focus/observer events are deduped.
+    function onWindowBlur() { lastSentSize = null; }
     function onWindowFocus() { setTimeout(() => safeFitAndResize(true), 50); }
+    window.addEventListener('blur', onWindowBlur);
     window.addEventListener('focus', onWindowFocus);
 
     return () => {
       cleanedUp.current = true;
+      stopTerminalTheme();
+      offWake();
+      if (livenessTimer) clearInterval(livenessTimer);
+      if (pongTimer) clearTimeout(pongTimer);
+      if (retryOnKeyHandler) { retryOnKeyHandler.dispose(); retryOnKeyHandler = null; }
       safeFitAndResizeRef.current = () => {};
       terminalDisposed = true;
       outputQueue = '';
@@ -927,10 +1243,12 @@ export function AgentTerminal({ sessionId, isActive, onExit, onInputStateChange,
       term.textarea?.removeEventListener('focus', onTermFocus);
       document.removeEventListener('visibilitychange', onVisibilityChange);
       window.removeEventListener('focus', onWindowFocus);
+      window.removeEventListener('blur', onWindowBlur);
       flushInputBuffer();
       if (outputFlushRaf) cancelAnimationFrame(outputFlushRaf);
       if (resizeRaf) cancelAnimationFrame(resizeRaf);
       if (resizeTrailing) clearTimeout(resizeTrailing);
+      if (graceTimer) clearTimeout(graceTimer);
       scrollDispose.dispose();
       observer.disconnect();
       wsRef.current?.close();
@@ -1003,7 +1321,7 @@ export function AgentTerminal({ sessionId, isActive, onExit, onInputStateChange,
       onDrop={fileDrop.onDrop}
       onPasteCapture={fileDrop.onPaste}
     >
-      <div ref={containerRef} style={{ width: '100%', height: '100%' }} onClick={() => termRef.current?.focus()} />
+      <div ref={containerRef} style={{ width: '100%', height: '100%', overflow: 'hidden' }} onClick={() => termRef.current?.focus()} />
       <SessionDropOverlay drop={fileDrop} />
       {showScrollDown && (
         <button

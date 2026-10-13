@@ -277,7 +277,9 @@ export function RestoreQueuePage() {
         </div>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          {items.map((item) => (
+          {items.map((item) => {
+          const bulkActive = !!bulkRunId && !bulkProgress?.done;
+          return (
             <div key={item.id} style={{ padding: 12, background: 'rgba(255,255,255,0.04)', border: '1px solid var(--pw-border)', borderRadius: 6, display: 'flex', flexDirection: 'column', gap: 8 }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, flexWrap: 'wrap' }}>
                 <span style={{ fontWeight: 600, color: 'var(--pw-text)' }}>{item.title || '(untitled session)'}</span>
@@ -301,18 +303,21 @@ export function RestoreQueuePage() {
               <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
                 <button
                   onClick={() => onRestore(item)}
-                  disabled={busyId === item.id}
-                  style={{ ...btnBase, background: 'rgba(29,155,240,0.18)', color: '#93c5fd', border: '1px solid rgba(29,155,240,0.4)', opacity: busyId === item.id ? 0.6 : 1 }}
+                  disabled={busyId === item.id || bulkActive}
+                  title={bulkActive ? 'A bulk restore is in progress — this item may already be queued in it' : undefined}
+                  style={{ ...btnBase, background: 'rgba(29,155,240,0.18)', color: '#93c5fd', border: '1px solid rgba(29,155,240,0.4)', opacity: busyId === item.id || bulkActive ? 0.6 : 1 }}
                 >Restore</button>
                 <button
                   onClick={() => { setPromptDraftFor(item.id); setPromptText(defaultPrompt); }}
-                  disabled={busyId === item.id}
-                  style={{ ...btnBase, background: 'rgba(0,0,0,0.3)', color: 'var(--pw-text)', border: '1px solid var(--pw-border)' }}
+                  disabled={busyId === item.id || bulkActive}
+                  title={bulkActive ? 'A bulk restore is in progress — this item may already be queued in it' : undefined}
+                  style={{ ...btnBase, background: 'rgba(0,0,0,0.3)', color: 'var(--pw-text)', border: '1px solid var(--pw-border)', opacity: bulkActive ? 0.6 : 1 }}
                 >Restore with custom prompt</button>
                 <button
                   onClick={() => onDismiss(item)}
-                  disabled={busyId === item.id}
-                  style={{ ...btnBase, background: 'transparent', color: 'var(--pw-text-muted)', border: '1px solid var(--pw-border)' }}
+                  disabled={busyId === item.id || bulkActive}
+                  title={bulkActive ? 'A bulk restore is in progress — this item may already be queued in it' : undefined}
+                  style={{ ...btnBase, background: 'transparent', color: 'var(--pw-text-muted)', border: '1px solid var(--pw-border)', opacity: bulkActive ? 0.6 : 1 }}
                 >Dismiss</button>
               </div>
 
@@ -336,7 +341,8 @@ export function RestoreQueuePage() {
                 </div>
               )}
             </div>
-          ))}
+          );
+          })}
         </div>
       )}
     </div>

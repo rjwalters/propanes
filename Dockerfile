@@ -92,16 +92,30 @@ RUN apt-get update \
 # npm self-update first: node:22-bookworm-slim's bundled npm vendors its own
 # old copies of picomatch, brace-expansion, sigstore, pacote, and ip-address
 # (all real CVEs per `npm audit`, living under npm's own node_modules, not
-# ours). npm's own maintainers ship and test those nested bumps together as
-# one release; we don't call any of those packages directly ourselves, so
-# this carries none of our own app's breaking-change risk.
-#
-# The updated npm (12.2.0) still vendors undici@6.28.0, which per `npm audit`
-# has 3 open CVEs of its own (needs 6.28.1+; 6.29.0 confirmed clean) — swap
-# just that nested copy for a clean one the same way linear-cli's vendored
-# deps get force-patched below.
+# ours). npm's own maintainers don't actually ship clean nested copies of all
+# of those together, though: npm@12.2.0 (latest) still vendors
+# brace-expansion@5.0.9, ip-address@10.5.0, postcss-selector-parser@7.1.4 and
+# undici@6.28.0, each one or more CVE-fix releases behind (5.0.12 / 10.7.1 /
+# 7.1.6 / 6.28.1; 6.29.0 confirmed clean for undici) — swap just those nested
+# copies for clean ones the same way linear-cli's vendored deps get
+# force-patched below.
 RUN npm install -g npm@latest \
  && ( cd "$(npm root -g)/npm" \
+      && npm pack brace-expansion@5.0.12 --pack-destination /tmp >/dev/null \
+      && rm -rf node_modules/brace-expansion \
+      && tar xzf /tmp/brace-expansion-5.0.12.tgz -C /tmp \
+      && mv /tmp/package node_modules/brace-expansion \
+      && rm -f /tmp/brace-expansion-5.0.12.tgz \
+      && npm pack ip-address@10.7.1 --pack-destination /tmp >/dev/null \
+      && rm -rf node_modules/ip-address \
+      && tar xzf /tmp/ip-address-10.7.1.tgz -C /tmp \
+      && mv /tmp/package node_modules/ip-address \
+      && rm -f /tmp/ip-address-10.7.1.tgz \
+      && npm pack postcss-selector-parser@7.1.6 --pack-destination /tmp >/dev/null \
+      && rm -rf node_modules/postcss-selector-parser \
+      && tar xzf /tmp/postcss-selector-parser-7.1.6.tgz -C /tmp \
+      && mv /tmp/package node_modules/postcss-selector-parser \
+      && rm -f /tmp/postcss-selector-parser-7.1.6.tgz \
       && npm pack undici@6.29.0 --pack-destination /tmp >/dev/null \
       && rm -rf node_modules/undici \
       && tar xzf /tmp/undici-6.29.0.tgz -C /tmp \

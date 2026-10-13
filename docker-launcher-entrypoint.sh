@@ -146,7 +146,11 @@ fluxbox >/var/log/fluxbox.log 2>&1 &
 sleep 1
 x11vnc -display "$DISPLAY" -rfbauth /root/.vnc/passwd -localhost -forever -shared -rfbport 5900 -quiet >/var/log/x11vnc.log 2>&1 &
 sleep 1
-websockify --web=/usr/share/novnc 6080 localhost:5900 >/var/log/novnc.log 2>&1 &
+# /opt/novnc: the Dockerfile copies the static noVNC client out of Debian's
+# novnc package and purges the package itself (it hard-depends on Debian's
+# nodejs, which drags in a vulnerable node-undici) before the final image
+# layer.
+websockify --web=/opt/novnc 6080 localhost:5900 >/var/log/novnc.log 2>&1 &
 
 # Playwright MCP, headed on the virtual display.
 DISPLAY="$DISPLAY" npx --yes @playwright/mcp@latest \

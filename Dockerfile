@@ -68,12 +68,46 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates curl feh fluxbox imagemagick novnc psmisc tmux util-linux websockify \
       x11-utils x11-xserver-utils x11vnc xauth xvfb xz-utils \
+ # Debian's novnc package hard-depends on Debian's own nodejs (-> libnode108
+ # -> node-undici 5.15.0, a real CVE cluster per `npm audit`), purely to ship
+ # a couple of unused build-time helper scripts (utils/genkeysymdef.js,
+ # utils/use_require.js). The actual noVNC client is the static HTML/JS/CSS
+ # under /usr/share/novnc/app, served by websockify's own --web flag (Python,
+ # not Node) — see docker-launcher-entrypoint.sh. Keep just those static
+ # assets and purge the Debian nodejs chain that dragged node-undici in.
+ && mkdir -p /opt/novnc && cp -r /usr/share/novnc/. /opt/novnc/ \
+ && apt-get purge -y nodejs novnc \
+ && apt-get autoremove -y \
+ # node-undici's own dpkg entry survives a plain purge as "config-files"
+ # (deinstall ok config-files, version still recorded) even though it has no
+ # actual conffiles — that residual version string is exactly what a
+ # dpkg-status-based image scan keys on, so purge it again explicitly.
+ && dpkg --purge node-undici 2>/dev/null || true \
  && rm -rf /var/lib/apt/lists/*
 
 # Playwright MCP + headed Chromium. The MCP/browser process runs as root so the
 # browser cache stays readable at /root/.cache; Claude/Codex agents run as the
 # non-root propanes user with their writable home on /data.
-RUN npm i -g \
+#
+# npm self-update first: node:22-bookworm-slim's bundled npm vendors its own
+# old copies of picomatch, brace-expansion, sigstore, pacote, and ip-address
+# (all real CVEs per `npm audit`, living under npm's own node_modules, not
+# ours). npm's own maintainers ship and test those nested bumps together as
+# one release; we don't call any of those packages directly ourselves, so
+# this carries none of our own app's breaking-change risk.
+#
+# The updated npm (12.2.0) still vendors undici@6.28.0, which per `npm audit`
+# has 3 open CVEs of its own (needs 6.28.1+; 6.29.0 confirmed clean) — swap
+# just that nested copy for a clean one the same way linear-cli's vendored
+# deps get force-patched below.
+RUN npm install -g npm@latest \
+ && ( cd "$(npm root -g)/npm" \
+      && npm pack undici@6.29.0 --pack-destination /tmp >/dev/null \
+      && rm -rf node_modules/undici \
+      && tar xzf /tmp/undici-6.29.0.tgz -C /tmp \
+      && mv /tmp/package node_modules/undici \
+      && rm -f /tmp/undici-6.29.0.tgz ) \
+ && npm i -g \
       @anthropic-ai/claude-code@2.1.232 \
       @openai/codex@0.142.5 \
       @schpet/linear-cli@2.2.0 \

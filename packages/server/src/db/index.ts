@@ -354,6 +354,14 @@ export function runMigrations() {
     // Manual PR badge adds/removals from the admin session menu.
     `ALTER TABLE agent_sessions ADD COLUMN pr_urls_added TEXT`,
     `ALTER TABLE agent_sessions ADD COLUMN pr_urls_hidden TEXT`,
+    // Restart/restore workflow (restore-queue.ts): distinguishes sessions
+    // cleanupOrphanedSessions failed because propanes.service restarted out
+    // from under them from ordinary task failures, and lets an operator
+    // dismiss a queue item without restoring it.
+    `ALTER TABLE agent_sessions ADD COLUMN failure_reason TEXT`,
+    `ALTER TABLE agent_sessions ADD COLUMN restore_dismissed_at TEXT`,
+    `CREATE INDEX IF NOT EXISTS idx_agent_sessions_failure_reason ON agent_sessions(failure_reason, restore_dismissed_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_agent_sessions_claude_session ON agent_sessions(claude_session_id, last_activity_at)`,
   ];
 
   // NOTE: alterStatements are applied at the END of runMigrations(), after

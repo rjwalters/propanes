@@ -258,7 +258,7 @@ function routeToViewId(route: string): string | null {
 // agent-settings link opening #/settings/agents in a new browser tab) are
 // silently swallowed whenever another pane tab is active.
 const SETTINGS_PANEL_KEYS = new Set([
-  'users', 'usage', 'agents', 'infrastructure', 'wiggum',
+  'users', 'usage', 'agents', 'infrastructure', 'wiggum', 'restore-queue',
   'user-guide', 'getting-started', 'preferences',
 ]);
 

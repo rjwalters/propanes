@@ -11,6 +11,7 @@ import { LiveConnectionsPage } from '../../pages/LiveConnectionsPage.js';
 import { SettingsPage } from '../../pages/SettingsPage.js';
 import { AppSettingsPage } from '../../pages/AppSettingsPage.js';
 import { InfrastructurePage } from '../../pages/InfrastructurePage.js';
+import { RestoreQueuePage } from '../../pages/RestoreQueuePage.js';
 import { UserGuidePage } from '../../pages/UserGuidePage.js';
 import { WiggumPage } from '../../pages/WiggumPage.js';
 import { FlatterPage } from '../../pages/FlatterPage.js';
@@ -100,6 +101,8 @@ export function PageView() {
     page = <WiggumPage />;
   } else if (route === '/settings/infrastructure') {
     page = <InfrastructurePage />;
+  } else if (route === '/settings/restore-queue') {
+    page = <RestoreQueuePage />;
   } else if (route === '/settings/machines' || route === '/settings/harnesses' || route === '/settings/sprites') {
     navigate('/settings/infrastructure');
     return null;

@@ -66,6 +66,7 @@ async function pollLiveConnections() {
 const settingsItems: { path: string; label: string; icon: NavIconName; adminOnly?: boolean }[] = [
   { path: '/settings/agents', label: 'Agents', icon: 'agents', adminOnly: true },
   { path: '/settings/infrastructure', label: 'Infrastructure', icon: 'infrastructure', adminOnly: true },
+  { path: '/settings/restore-queue', label: 'Restore queue', icon: 'restore', adminOnly: true },
   { path: '/settings/users', label: 'Users', icon: 'users', adminOnly: true },
   { path: '/settings/usage', label: 'Usage', icon: 'usage', adminOnly: true },
   { path: '/settings/user-guide', label: 'User Guide', icon: 'guide' },

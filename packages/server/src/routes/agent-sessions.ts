@@ -7,6 +7,15 @@ import { createHash } from 'node:crypto';
 import { db, schema } from '../db/index.js';
 import { killSession } from '../agent-sessions.js';
 import { resumeAgentSession, dispatchTerminalSession, transferSession, getTransfer } from '../dispatch.js';
+import {
+  listRestoreQueue,
+  restoreQueueItem,
+  dismissRestoreQueueItem,
+  startBulkRestore,
+  getBulkRestoreProgress,
+  getSessionOutcome,
+  DEFAULT_RESTORE_PROMPT,
+} from '../restore-queue.js';
 import { getSessionLiveStates, inputSessionRemote, sendKeysSessionRemote } from '../session-service-client.js';
 import { getLauncher, sendAndWait } from '../launcher-registry.js';
 import { getTmuxPanePid } from '../tmux-pty.js';
@@ -66,6 +75,69 @@ agentSessionRoutes.get('/transfers/:transferId', async (c) => {
     parentSessionId: transfer.parentSessionId,
     error: transfer.error,
   });
+});
+
+// Restart/restore workflow — admin-only, cluster-wide (not member-scoped: an
+// orphaned session belongs to whoever owned it, but triaging a service
+// restart is an operator task). Registered before /:id so these literal
+// paths aren't swallowed by the :id param route below.
+agentSessionRoutes.get('/restore-queue', async (c) => {
+  if (getAdminUser(c).role !== 'admin') return c.json({ error: 'Unauthorized' }, 403);
+  const items = await listRestoreQueue();
+  return c.json({ items, defaultPrompt: DEFAULT_RESTORE_PROMPT });
+});
+
+agentSessionRoutes.get('/restore-queue/outcomes', async (c) => {
+  if (getAdminUser(c).role !== 'admin') return c.json({ error: 'Unauthorized' }, 403);
+  const idsParam = c.req.query('ids') || '';
+  const ids = idsParam.split(',').map((s) => s.trim()).filter(Boolean);
+  const outcomes: Record<string, string> = {};
+  for (const id of ids) outcomes[id] = getSessionOutcome(id);
+  return c.json({ outcomes });
+});
+
+agentSessionRoutes.post('/restore-queue/:id/restore', async (c) => {
+  if (getAdminUser(c).role !== 'admin') return c.json({ error: 'Unauthorized' }, 403);
+  const id = c.req.param('id');
+  const body = await c.req.json().catch(() => ({}));
+  const prompt = typeof body.prompt === 'string' ? body.prompt : undefined;
+  try {
+    const result = await restoreQueueItem(id, { prompt });
+    return c.json(result);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Restore failed';
+    return c.json({ error: msg }, 400);
+  }
+});
+
+agentSessionRoutes.post('/restore-queue/:id/dismiss', async (c) => {
+  if (getAdminUser(c).role !== 'admin') return c.json({ error: 'Unauthorized' }, 403);
+  const id = c.req.param('id');
+  const ok = dismissRestoreQueueItem(id);
+  if (!ok) return c.json({ error: 'Not an open restore-queue item' }, 404);
+  return c.json({ id, dismissed: true });
+});
+
+agentSessionRoutes.post('/restore-queue/restore-all', async (c) => {
+  if (getAdminUser(c).role !== 'admin') return c.json({ error: 'Unauthorized' }, 403);
+  const body = await c.req.json().catch(() => ({}));
+  let ids: string[] = Array.isArray(body.ids) ? body.ids.filter((v: unknown) => typeof v === 'string') : [];
+  if (ids.length === 0) {
+    const items = await listRestoreQueue();
+    ids = items.map((i) => i.id);
+  }
+  if (ids.length === 0) return c.json({ error: 'Nothing to restore' }, 400);
+  const prompt = typeof body.prompt === 'string' ? body.prompt : undefined;
+  const intervalMs = typeof body.intervalMs === 'number' ? body.intervalMs : undefined;
+  const runId = startBulkRestore(ids, { prompt, intervalMs });
+  return c.json({ runId, total: ids.length });
+});
+
+agentSessionRoutes.get('/restore-queue/bulk/:runId', async (c) => {
+  if (getAdminUser(c).role !== 'admin') return c.json({ error: 'Unauthorized' }, 403);
+  const progress = getBulkRestoreProgress(c.req.param('runId'));
+  if (!progress) return c.json({ error: 'Unknown or expired run' }, 404);
+  return c.json(progress);
 });
 
 // Search JSONL content across all sessions

@@ -1406,4 +1406,57 @@ export const api = {
       `/admin/chief-of-staff/approvals/${id}/deny`,
       { method: 'POST', body: JSON.stringify({ reason }) },
     ),
+
+  // Restart/restore workflow — sessions cleanupOrphanedSessions marked
+  // 'failed' because propanes.service restarted out from under them.
+  getRestoreQueue: () =>
+    request<{
+      items: Array<{
+        id: string;
+        claudeSessionId: string | null;
+        title: string | null;
+        cwd: string | null;
+        permissionProfile: string;
+        runtime: string;
+        ownerUserId: string | null;
+        orgId: string | null;
+        lastActivityAt: string | null;
+        createdAt: string;
+        completedAt: string | null;
+        collapsedRowCount: number;
+      }>;
+      defaultPrompt: string;
+    }>('/admin/agent-sessions/restore-queue'),
+
+  restoreQueueItem: (id: string, prompt?: string) =>
+    request<{ sessionId: string }>(
+      `/admin/agent-sessions/restore-queue/${id}/restore`,
+      { method: 'POST', body: JSON.stringify({ prompt }) },
+    ),
+
+  dismissRestoreQueueItem: (id: string) =>
+    request<{ id: string; dismissed: boolean }>(
+      `/admin/agent-sessions/restore-queue/${id}/dismiss`,
+      { method: 'POST' },
+    ),
+
+  restoreQueueAll: (ids: string[], prompt?: string, intervalMs?: number) =>
+    request<{ runId: string; total: number }>(
+      '/admin/agent-sessions/restore-queue/restore-all',
+      { method: 'POST', body: JSON.stringify({ ids, prompt, intervalMs }) },
+    ),
+
+  getBulkRestoreProgress: (runId: string) =>
+    request<{
+      total: number;
+      attempted: number;
+      succeeded: Array<{ parentId: string; sessionId: string }>;
+      failed: Array<{ parentId: string; error: string }>;
+      done: boolean;
+    }>(`/admin/agent-sessions/restore-queue/bulk/${runId}`),
+
+  getRestoreOutcomes: (sessionIds: string[]) =>
+    request<{ outcomes: Record<string, string> }>(
+      `/admin/agent-sessions/restore-queue/outcomes?ids=${sessionIds.map(encodeURIComponent).join(',')}`,
+    ),
 };

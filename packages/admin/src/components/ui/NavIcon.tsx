@@ -18,6 +18,7 @@ const paths = {
   search: 'M10 3a7 7 0 1 0 0 14 7 7 0 0 0 0-14 M15 15l6 6',
   bell: 'M5 17h14l-2-3V9a5 5 0 0 0-10 0v5z M10 21h4',
   link: 'm9 15 6-6 M8 16l-1 1a4 4 0 0 1-6-6l4-4a4 4 0 0 1 6 0 M16 8l1-1a4 4 0 0 1 6 6l-4 4a4 4 0 0 1-6 0',
+  restore: 'M3 12a9 9 0 1 0 3-6.7 M3 3v6h6',
 } as const;
 
 export type NavIconName = keyof typeof paths;

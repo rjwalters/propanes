@@ -34,6 +34,7 @@ import { UsersPage } from '../../pages/UsersPage.js';
 import { UsagePage } from '../../pages/UsagePage.js';
 import { ChannelPage } from '../../pages/ChannelPage.js';
 import { ApprovalQueuePage } from '../../pages/ApprovalQueuePage.js';
+import { RestoreQueuePage } from '../../pages/RestoreQueuePage.js';
 import { SpecWikiPage } from '../../pages/SpecWikiPage.js';
 import { FlatterPage } from '../../pages/FlatterPage.js';
 import {
@@ -151,6 +152,7 @@ export function renderTabContent(
           : key === 'agents' ? <AgentsPage />
           : key === 'infrastructure' ? <InfrastructurePage />
           : key === 'wiggum' ? <WiggumPage />
+          : key === 'restore-queue' ? <RestoreQueuePage />
           : key === 'user-guide' ? <UserGuidePage />
           : key === 'getting-started' ? <GettingStartedPage />
           : key === 'preferences' ? <SettingsPage />

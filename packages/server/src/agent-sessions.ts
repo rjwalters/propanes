@@ -436,20 +436,25 @@ export async function killSession(sessionId: string, reason = 'main-server killS
   return true;
 }
 
-export async function cleanupOrphanedSessions(): Promise<void> {
-  const runningSessions = db
-    .select({ id: schema.agentSessions.id, launcherId: schema.agentSessions.launcherId })
-    .from(schema.agentSessions)
-    .where(eq(schema.agentSessions.status, 'running'))
-    .all();
+export interface LivenessContext {
+  activeSvcSessions: Set<string> | null;
+  serviceTmuxSessions: Set<string> | null;
+  tmuxAvailable: boolean | undefined;
+  launcherSessions: Set<string>;
+}
 
-  if (runningSessions.length === 0) return;
-
-  // Check which sessions are still alive in the session-service
-  // Returns null if the service is unreachable
+/**
+ * Snapshot the same three liveness signals cleanupOrphanedSessions uses
+ * (session-service's active/tmux session lists, connected-launcher session
+ * lists), taken fresh at call time. Shared so the restart/restore queue
+ * (restore-queue.ts) re-checks liveness with the exact same rules instead of
+ * duplicating them — and so a session mis-marked during a transient blip in
+ * the original sweep can be recognized as alive later, when the queue is
+ * actually viewed.
+ */
+export async function snapshotLiveness(): Promise<LivenessContext> {
   const serviceHealth = await getSessionServiceHealthSnapshot();
 
-  // Check which sessions are on connected launchers
   const launcherSessions = new Set<string>();
   for (const launcher of listLaunchers()) {
     if (launcher.ws.readyState === 1) {
@@ -459,31 +464,59 @@ export async function cleanupOrphanedSessions(): Promise<void> {
     }
   }
 
-  const activeSvcSessions = serviceHealth ? new Set(serviceHealth.sessions || []) : null;
-  const serviceTmuxSessions = serviceHealth?.tmuxSessions ? new Set(serviceHealth.tmuxSessions) : null;
+  return {
+    activeSvcSessions: serviceHealth ? new Set(serviceHealth.sessions || []) : null,
+    serviceTmuxSessions: serviceHealth?.tmuxSessions ? new Set(serviceHealth.tmuxSessions) : null,
+    tmuxAvailable: serviceHealth?.tmuxAvailable,
+    launcherSessions,
+  };
+}
+
+/**
+ * Is this session alive right now per `ctx`? `null` means inconclusive (the
+ * service was unreachable, or reports tmux unavailable) rather than "dead" —
+ * callers must decide separately whether inconclusive counts as alive for
+ * their purpose (cleanupOrphanedSessions treats it as "don't touch";
+ * restore-queue treats it as "not confirmed alive, still show it").
+ */
+export function isSessionAliveNow(
+  sessionId: string,
+  launcherId: string | null | undefined,
+  ctx: LivenessContext,
+): boolean | null {
+  if (ctx.activeSvcSessions?.has(sessionId)) return true;
+  // Session-service can see the backing tmux session even if it has not
+  // reattached yet — that's recoverable, not dead.
+  if (ctx.serviceTmuxSessions?.has(sessionId)) return true;
+  if (isSpriteSession(sessionId)) return true;
+  if (launcherId && ctx.launcherSessions.has(sessionId)) return true;
+  if (!ctx.activeSvcSessions) return null; // service unreachable: inconclusive
+  if (ctx.tmuxAvailable === false) return null; // tmux itself unavailable: inconclusive
+  return false;
+}
+
+export async function cleanupOrphanedSessions(): Promise<void> {
+  const runningSessions = db
+    .select({ id: schema.agentSessions.id, launcherId: schema.agentSessions.launcherId })
+    .from(schema.agentSessions)
+    .where(eq(schema.agentSessions.status, 'running'))
+    .all();
+
+  if (runningSessions.length === 0) return;
+
+  const ctx = await snapshotLiveness();
 
   const now = new Date().toISOString();
   for (const session of runningSessions) {
-    // Session-service confirms it's alive
-    if (activeSvcSessions?.has(session.id)) continue;
-    // Session-service can see the backing tmux session even if it has not
-    // reattached yet. Do not convert that to "failed"; leave it recoverable.
-    if (serviceTmuxSessions?.has(session.id)) continue;
-    // Sprite session still active
-    if (isSpriteSession(session.id)) continue;
-    // Launcher confirms it's alive
-    if (session.launcherId && launcherSessions.has(session.id)) continue;
-    // Session-service was unreachable, or it reports tmux as unavailable.
-    // Both cases are inconclusive, so do not mass-fail running DB rows.
-    if (!activeSvcSessions) continue;
-    if (serviceHealth?.tmuxAvailable === false) continue;
+    const alive = isSessionAliveNow(session.id, session.launcherId, ctx);
+    if (alive !== false) continue; // true (alive) or null (inconclusive): leave it
 
     appendSessionAuditMarker(
       session.id,
-      `main-server cleanupOrphanedSessions marked failed; activeService=false tmuxSession=${serviceTmuxSessions ? 'missing' : 'unknown'} launcherSession=${session.launcherId ? 'missing' : 'none'}`
+      `main-server cleanupOrphanedSessions marked failed; activeService=false tmuxSession=${ctx.serviceTmuxSessions ? 'missing' : 'unknown'} launcherSession=${session.launcherId ? 'missing' : 'none'}`
     );
     db.update(schema.agentSessions)
-      .set({ status: 'failed', completedAt: now })
+      .set({ status: 'failed', completedAt: now, failureReason: 'orphaned_restart' })
       .where(eq(schema.agentSessions.id, session.id))
       .run();
     updateFeedbackOnSessionEnd(session.id, 'failed');

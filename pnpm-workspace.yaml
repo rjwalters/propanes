@@ -11,3 +11,8 @@ allowBuilds:
   esbuild: true
   node-pty: true
   ssh2: true
+
+# shell-quote comes in transitively (concurrently; gel via drizzle-kit and
+# drizzle-orm) pinned below the CVE-2026-9277/CVE-2026-13311 fix.
+overrides:
+  shell-quote: ^1.9.0

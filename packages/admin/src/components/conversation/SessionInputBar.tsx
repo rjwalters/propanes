@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'preact/hooks';
 import { api } from '../../lib/api.js';
-import { resumeSession, lastResumeError } from '../../lib/sessions.js';
+import { resumeSession, lastResumeError, lastTerminalInput } from '../../lib/sessions.js';
+import { shouldYieldAutoFocus } from '../../lib/focus-guard.js';
 import { sendKeysReliable, queuedSends, outboxErrors, dismissOutboxError } from '../../lib/send-outbox.js';
 import type { ParsedMessage } from '../../lib/output-parser.js';
 
@@ -152,16 +153,24 @@ export function SessionInputBar({ sessionId, lastMessage, inputState, isRunning 
     }
   }, [askQuestion?.question, askQuestion?.options?.length]);
 
-  // Auto-focus when entering waiting state
+  // Auto-focus when entering waiting state. Keystrokes in a PTY pane flap the
+  // state active → waiting (see focus-guard.ts), so never grab focus away from
+  // a terminal or another text field the operator is already using.
   useEffect(() => {
     if (isWaiting) {
-      setTimeout(() => {
+      const t = setTimeout(() => {
+        if (shouldYieldAutoFocus({
+          activeElement: document.activeElement,
+          lastTerminalInputAt: lastTerminalInput.value,
+          own: [inputRef.current, textareaRef.current],
+        })) return;
         if (askQuestion && !askQuestion.options) {
           textareaRef.current?.focus();
         } else if (!askQuestion) {
           inputRef.current?.focus();
         }
       }, 100);
+      return () => clearTimeout(t);
     }
   }, [isWaiting, !!askQuestion]);
 

@@ -9,6 +9,7 @@ import { copyText } from '../../lib/clipboard.js';
 import { openUrlCompanion } from '../../lib/companion-state.js';
 import { recordPerfEntry } from '../../lib/perf.js';
 import { onWake } from '../../lib/wake.js';
+import { settleTerminalCursor } from '../../lib/terminal-cursor.js';
 import { useSessionFileDrop, SessionDropOverlay } from './SessionFileDrop.js';
 import type { InputState } from '../../lib/sessions.js';
 
@@ -263,6 +264,7 @@ export function AgentTerminal({ sessionId, isActive, onExit, onInputStateChange,
     });
 
     term.open(containerRef.current);
+    const cursorSettler = settleTerminalCursor(term, containerRef.current);
 
     // Only fit if container is visible (non-zero size); hidden tabs fit on activation
     if (containerRef.current.offsetWidth > 0) {
@@ -336,6 +338,7 @@ export function AgentTerminal({ sessionId, isActive, onExit, onInputStateChange,
         outputWriteActive = false;
         updateScrollState();
         if (!terminalDisposed && outputQueue) scheduleOutputFlush(true);
+        else if (!terminalDisposed) cursorSettler.drained();
       });
     }
 
@@ -343,6 +346,7 @@ export function AgentTerminal({ sessionId, isActive, onExit, onInputStateChange,
 
     function writeTerminal(data: string) {
       if (terminalDisposed || !data) return;
+      cursorSettler.output();
       outputQueue += data;
       scheduleOutputFlush(false);
     }
@@ -1222,6 +1226,7 @@ export function AgentTerminal({ sessionId, isActive, onExit, onInputStateChange,
       if (retryOnKeyHandler) { retryOnKeyHandler.dispose(); retryOnKeyHandler = null; }
       safeFitAndResizeRef.current = () => {};
       terminalDisposed = true;
+      cursorSettler.dispose();
       outputQueue = '';
       // Release resize ownership if we still hold it
       if (resizeOwners.get(sessionId) === ownerToken) resizeOwners.delete(sessionId);

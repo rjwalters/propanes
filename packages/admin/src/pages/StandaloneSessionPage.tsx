@@ -74,6 +74,22 @@ export function StandaloneSessionPage({ sessionId }: { sessionId: string }) {
     return cleanup;
   }, []);
 
+  return (
+    <div class="standalone-session-root">
+      <StandaloneSessionView sessionId={sessionId} setDocumentTitle />
+      <SshSetupDialog />
+    </div>
+  );
+}
+
+// Toolbar + terminal/structured body for a single session, without the pane
+// tree. Callers own session polling and the outer container.
+export function StandaloneSessionView({ sessionId, onClose, setDocumentTitle, showFeedbackLink = true }: {
+  sessionId: string;
+  onClose?: () => void;
+  setDocumentTitle?: boolean;
+  showFeedbackLink?: boolean;
+}) {
   const companion = isCompanionTab(sessionId);
   const sessions = allSessions.value;
   const sess = sessions.find((s: any) => s.id === sessionId);
@@ -85,13 +101,13 @@ export function StandaloneSessionPage({ sessionId }: { sessionId: string }) {
 
   const title = standaloneTitle(sessionId, sess, isExited);
   useEffect(() => {
-    document.title = title;
-  }, [title]);
+    if (setDocumentTitle) document.title = title;
+  }, [title, setDocumentTitle]);
 
   const showIdMenu = !companion && idMenuOpen.value;
 
   return (
-    <div class="standalone-session-root">
+    <>
       <div class="standalone-session-toolbar" role="region" aria-label="Session controls">
         {mobile && (
           <button
@@ -131,7 +147,7 @@ export function StandaloneSessionPage({ sessionId }: { sessionId: string }) {
           </>
         )}
         {isExited && <span class="standalone-session-status">(exited)</span>}
-        {!companion && sess?.feedbackId && sess?.feedbackTitle && (
+        {showFeedbackLink && !companion && sess?.feedbackId && sess?.feedbackTitle && (
           <button
             class="session-feedback-link"
             onClick={(e) => { e.stopPropagation(); goToFeedback(sess.feedbackId); }}
@@ -157,6 +173,17 @@ export function StandaloneSessionPage({ sessionId }: { sessionId: string }) {
             {!mobile && <option value="split">Split</option>}
           </select>
         )}
+        {onClose && (
+          <button
+            type="button"
+            class="standalone-session-close"
+            onClick={onClose}
+            aria-label="Close session pane"
+            title="Close"
+          >
+            ×
+          </button>
+        )}
       </div>
       <div style={{ flex: 1, minHeight: 0, display: 'flex' }}>
         {companion ? (
@@ -172,7 +199,6 @@ export function StandaloneSessionPage({ sessionId }: { sessionId: string }) {
           />
         )}
       </div>
-      <SshSetupDialog />
-    </div>
+    </>
   );
 }

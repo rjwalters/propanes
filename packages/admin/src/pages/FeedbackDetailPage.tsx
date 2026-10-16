@@ -185,7 +185,14 @@ function DescriptionDisplay({ fb, onEdit, onScreenshotClick, liveConnections, ex
   );
 }
 
-export function FeedbackDetailPage({ id, appId, embedded }: { id: string; appId: string | null; embedded?: boolean }) {
+export function FeedbackDetailPage({ id, appId, embedded, onOpenSession }: {
+  id: string;
+  appId: string | null;
+  embedded?: boolean;
+  // Standalone pages have no pane tree, so they render attached sessions themselves.
+  onOpenSession?: (sessionId: string) => void;
+}) {
+  const showSession = onOpenSession ?? openSession;
   const feedback = useSignal<any>(null);
   const loading = useSignal(true);
   const error = useSignal('');
@@ -962,7 +969,7 @@ export function FeedbackDetailPage({ id, appId, embedded }: { id: string; appId:
                       <div style="display:flex;gap:4px">
                         <button
                           class="btn btn-sm"
-                          onClick={() => openSession(s.id)}
+                          onClick={() => showSession(s.id)}
                         >
                           {s.status === 'running' ? 'Attach' : 'View Log'}
                         </button>
@@ -971,7 +978,10 @@ export function FeedbackDetailPage({ id, appId, embedded }: { id: string; appId:
                             class="btn btn-sm btn-primary"
                             onClick={async () => {
                               const newId = await resumeSession(s.id);
-                              if (newId) loadSessions(fb.id);
+                              if (newId) {
+                                loadSessions(fb.id);
+                                onOpenSession?.(newId);
+                              }
                             }}
                           >
                             Resume
